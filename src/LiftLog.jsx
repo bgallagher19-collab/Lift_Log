@@ -29,6 +29,9 @@ import {
   Target,
   Sun,
   Sparkles,
+  Star,
+  Heart,
+  Bike,
 } from 'lucide-react'
 
 // ============================================================
@@ -41,6 +44,7 @@ const STORAGE = {
   active: 'liftlog:active',
   bodyWeight: 'liftlog:bodyWeight',
   planDraft: 'liftlog:planDraft',
+  favorites: 'liftlog:favorites',
 }
 
 const MUSCLE_GROUPS = ['Chest', 'Back', 'Shoulders', 'Arms', 'Legs', 'Core']
@@ -517,28 +521,43 @@ function buildPlanItem(exercise, muscleGroup, workouts, isAnchor) {
 // Pick `count` exercises for a muscle group: optionally lead with an anchor
 // compound, then fill with accessories preferring those with history (oldest
 // first) so the user rotates through variations.
-function pickExercisesForGroup(group, workouts, count, includeAnchor, filter) {
+function pickExercisesForGroup(
+  group,
+  workouts,
+  count,
+  includeAnchor,
+  filter,
+  favorites = [],
+) {
   const all = [...(EXERCISES[group] || []), ...customInGroup(group, workouts)]
     .filter((e) => (filter ? filter(e) : true))
   if (all.length === 0) return []
 
+  const favSet = new Set(favorites)
   const picks = []
   const used = new Set()
 
   if (includeAnchor) {
-    for (const a of ANCHOR_EXERCISES[group] || []) {
-      if (all.includes(a)) {
-        picks.push(buildPlanItem(a, group, workouts, true))
-        used.add(a)
-        break
-      }
+    // Prefer a favorited anchor if there is one
+    const anchors = ANCHOR_EXERCISES[group] || []
+    const favAnchor = anchors.find((a) => all.includes(a) && favSet.has(a))
+    const anchor = favAnchor || anchors.find((a) => all.includes(a))
+    if (anchor) {
+      picks.push(buildPlanItem(anchor, group, workouts, true))
+      used.add(anchor)
     }
   }
 
   const candidates = all
     .filter((e) => !used.has(e))
-    .map((e) => ({ exercise: e, last: lastOccurrence(e, workouts) }))
+    .map((e) => ({
+      exercise: e,
+      last: lastOccurrence(e, workouts),
+      fav: favSet.has(e),
+    }))
     .sort((a, b) => {
+      // Favorites first
+      if (a.fav !== b.fav) return a.fav ? -1 : 1
       if (a.last && !b.last) return -1
       if (!a.last && b.last) return 1
       if (a.last && b.last) return a.last.date - b.last.date
@@ -554,7 +573,7 @@ function pickExercisesForGroup(group, workouts, count, includeAnchor, filter) {
   return picks
 }
 
-function suggestSessionPlan(workouts) {
+function suggestSessionPlan(workouts, favorites = []) {
   const dayType = pickDayType(workouts)
   const [primary, secondary] = DAY_FOCUS[dayType]
   const lastMap = lastByMuscleGroup(workouts)
@@ -567,13 +586,22 @@ function suggestSessionPlan(workouts) {
   }
 
   const exercises = [
-    ...pickExercisesForGroup(primary, workouts, 3, true),
-    ...pickExercisesForGroup(secondary, workouts, 2, true, secondaryFilter),
+    ...pickExercisesForGroup(primary, workouts, 3, true, null, favorites),
+    ...pickExercisesForGroup(
+      secondary,
+      workouts,
+      2,
+      true,
+      secondaryFilter,
+      favorites,
+    ),
   ]
 
   // Always add 1 core movement on non-LEGS days
   if (primary !== 'Core' && secondary !== 'Core') {
-    exercises.push(...pickExercisesForGroup('Core', workouts, 1, false))
+    exercises.push(
+      ...pickExercisesForGroup('Core', workouts, 1, false, null, favorites),
+    )
   }
 
   const primaryGap = daysSince(lastMap[primary])
@@ -673,31 +701,10 @@ function weeklyAgg(sessions, workouts, nWeeks = 8) {
 
 // ----- READINESS & DIFFICULTY -----
 
-// 0 = wrecked, 1 = peak. Feels weighted highest because subjective signal
-// integrates fatigue/CNS load that the other inputs miss.
-function computeReadiness({ feel, fastingState, sleepHours }) {
-  const feelScore = Math.max(0, (Number(feel || 3) - 1) / 4)
-  const fastingScore =
-    fastingState === 'FED'
-      ? 1.0
-      : fastingState === 'PARTIAL'
-        ? 0.7
-        : fastingState === 'FASTED'
-          ? 0.4
-          : 0.7
-
-  const sleep = Number(sleepHours) || 0
-  let sleepScore
-  if (sleep === 0) sleepScore = 0.7 // unspecified — assume average
-  else if (sleep < 5) sleepScore = 0.0
-  else if (sleep < 6) sleepScore = 0.4
-  else if (sleep < 7) sleepScore = 0.7
-  else sleepScore = 1.0
-
-  return Math.max(
-    0,
-    Math.min(1, feelScore * 0.5 + fastingScore * 0.2 + sleepScore * 0.3),
-  )
+// 0 = wrecked, 1 = peak. Driven by self-reported feel only; fasting/sleep/energy
+// inputs were dropped from check-in (cross-reference from external apps instead).
+function computeReadiness({ feel }) {
+  return Math.max(0, Math.min(1, (Number(feel || 3) - 1) / 4))
 }
 
 function difficultyTier(readiness) {
@@ -851,6 +858,34 @@ function calculateScore(session, allSessions, allWorkouts) {
   }
 }
 
+// ----- CARDIO -----
+
+const CARDIO_TYPES = [
+  'Bike',
+  'Treadmill',
+  'Elliptical',
+  'Rowing',
+  'Swimming',
+  'Stairs',
+  'Walking',
+  'Other',
+]
+const CARDIO_INTENSITIES = ['Easy', 'Average', 'Intense']
+const CARDIO_INTENSITY_MULT = { Easy: 1.5, Average: 2.5, Intense: 4 }
+
+// Bonus points for cardio attached to a session. Cap +15.
+function cardioBonus(entries) {
+  if (!entries || entries.length === 0) return 0
+  let bonus = 0
+  for (const e of entries) {
+    const dur = Number(e.durationMin) || 0
+    const durFactor = Math.min(2, dur / 30)
+    const mult = CARDIO_INTENSITY_MULT[e.intensity] || 1.5
+    bonus += durFactor * mult
+  }
+  return Math.min(15, Math.round(bonus))
+}
+
 // ----- COACH WRAP-UP -----
 // Turn a completed session into trainer-style observations.
 
@@ -965,6 +1000,21 @@ function generateCoachWrapUp(session, allWorkouts, allSessions) {
     })
   }
 
+  // Cardio added on top
+  if (session.cardio && session.cardio.length > 0) {
+    const totalMin = session.cardio.reduce(
+      (s, c) => s + (Number(c.durationMin) || 0),
+      0,
+    )
+    const types = [...new Set(session.cardio.map((c) => c.type))]
+      .slice(0, 2)
+      .join(' + ')
+    wins.push({
+      title: 'Added cardio',
+      detail: `${totalMin} min of ${types}. Bonus +${cardioBonus(session.cardio)} for the recomp goal.`,
+    })
+  }
+
   // Floor for empty wins — give them something
   if (wins.length === 0 && sessionWorkouts.length > 0) {
     wins.push({
@@ -1053,15 +1103,6 @@ function generateCoachWrapUp(session, allWorkouts, allSessions) {
       '30–40 g of quality protein — eggs, lean meat, Greek yogurt, whey shake. Opens the repair window.',
   })
 
-  // Fasted refuel
-  if (session.fastingState === 'FASTED') {
-    advice.push({
-      title: 'Real refuel — not just protein',
-      detail:
-        'You trained fasted, glycogen is depleted. A full meal (protein + carbs) in the next 2 hours.',
-    })
-  }
-
   // Stretch by muscle
   if (muscleGroups.includes('Legs')) {
     advice.push({
@@ -1113,20 +1154,12 @@ function generateCoachWrapUp(session, allWorkouts, allSessions) {
     })
   }
 
-  // Sleep
-  const sleep = Number(session.sleepHours) || 0
-  if (sleep > 0 && sleep < 7) {
-    advice.push({
-      title: 'Bank sleep tonight',
-      detail: `${sleep}h last night isn't enough. Aim for 7+ — that's when real muscle gain happens.`,
-    })
-  } else {
-    advice.push({
-      title: 'Protect tonight\'s sleep',
-      detail:
-        '7–9 hours. CNS rebuilds in deep sleep; cutting it short blunts the work you just did.',
-    })
-  }
+  // Sleep (generic — sleepHours no longer captured at check-in)
+  advice.push({
+    title: 'Protect tonight\'s sleep',
+    detail:
+      '7–9 hours. CNS rebuilds in deep sleep; cutting it short blunts the work you just did.',
+  })
 
   // ===== HEADLINE =====
 
@@ -1164,6 +1197,53 @@ function Brand() {
     <div className="flex items-center justify-between pt-6 pb-5">
       <div className="text-2xl font-bold tracking-tight">Lift.Log</div>
       <div className="w-2 h-2 rounded-full bg-emerald-500/70" />
+    </div>
+  )
+}
+
+// Compact ring + center number for stats with a target (e.g. Lifts toward goal).
+function DonutStat({ label, current, goal }) {
+  const pct = goal > 0 ? Math.min(1, current / goal) : 0
+  const size = 56
+  const stroke = 5
+  const radius = (size - stroke) / 2
+  const c = 2 * Math.PI * radius
+  const offset = c * (1 - pct)
+  return (
+    <div className="rounded-xl bg-zinc-900/60 px-3 py-3 flex flex-col">
+      <div className="text-[11px] text-zinc-500 font-medium">{label}</div>
+      <div className="relative mt-1 mx-auto" style={{ width: size, height: size }}>
+        <svg width={size} height={size} className="-rotate-90 block">
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius}
+            fill="none"
+            stroke="rgb(39 39 42)"
+            strokeWidth={stroke}
+          />
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius}
+            fill="none"
+            stroke="rgb(16 185 129)"
+            strokeWidth={stroke}
+            strokeDasharray={c}
+            strokeDashoffset={offset}
+            strokeLinecap="round"
+            className="transition-[stroke-dashoffset] duration-500"
+          />
+        </svg>
+        <div className="absolute inset-0 flex flex-col items-center justify-center leading-none">
+          <span className="font-mono tabular-nums text-lg font-bold text-zinc-100">
+            {current}
+          </span>
+          <span className="text-[9px] text-zinc-500 mt-0.5 tabular-nums">
+            /{goal}
+          </span>
+        </div>
+      </div>
     </div>
   )
 }
@@ -1284,6 +1364,7 @@ export default function LiftLog() {
   const [editReturnView, setEditReturnView] = useState('session')
   const [bodyWeight, setBodyWeight] = useState(0)
   const [planDraft, setPlanDraft] = useState(null)
+  const [favorites, setFavorites] = useState([])
 
   // Load from localStorage on mount
   useEffect(() => {
@@ -1292,6 +1373,7 @@ export default function LiftLog() {
     setActive(loadJSON(STORAGE.active, null))
     setBodyWeight(Number(loadJSON(STORAGE.bodyWeight, 0)) || 0)
     setPlanDraft(loadJSON(STORAGE.planDraft, null))
+    setFavorites(loadJSON(STORAGE.favorites, []))
     setLoaded(true)
   }, [])
 
@@ -1318,6 +1400,19 @@ export default function LiftLog() {
     if (planDraft) saveJSON(STORAGE.planDraft, planDraft)
     else clearKey(STORAGE.planDraft)
   }, [planDraft, loaded])
+  useEffect(() => {
+    if (!loaded) return
+    saveJSON(STORAGE.favorites, favorites)
+  }, [favorites, loaded])
+
+  function toggleFavorite(exerciseName) {
+    setFavorites((prev) =>
+      prev.includes(exerciseName)
+        ? prev.filter((e) => e !== exerciseName)
+        : [...prev, exerciseName],
+    )
+  }
+  const isFavorite = (name) => favorites.includes(name)
 
   // Timer tick while in active session
   useEffect(() => {
@@ -1326,9 +1421,12 @@ export default function LiftLog() {
     return () => clearInterval(id)
   }, [active, view])
 
-  // Today's suggested plan — recomputed when workouts change.
+  // Today's suggested plan — recomputed when workouts or favorites change.
   // A draft (user-edited plan) overrides this until session start.
-  const todaysPlan = useMemo(() => suggestSessionPlan(workouts), [workouts])
+  const todaysPlan = useMemo(
+    () => suggestSessionPlan(workouts, favorites),
+    [workouts, favorites],
+  )
   const resolvedPlan = planDraft || todaysPlan
 
   // -------------- handlers --------------
@@ -1336,7 +1434,7 @@ export default function LiftLog() {
   function startSession(checkin) {
     // Snapshot the plan into the session so it doesn't shift mid-session
     // as workouts get logged. Prefer the user's edited draft if present.
-    const snapshot = planDraft || suggestSessionPlan(workouts)
+    const snapshot = planDraft || suggestSessionPlan(workouts, favorites)
     const readiness = computeReadiness(checkin)
     const adjustedPlan = applyDifficulty(snapshot, readiness)
     const s = {
@@ -1344,15 +1442,12 @@ export default function LiftLog() {
       startTime: Date.now(),
       endTime: null,
       feel: checkin.feel,
-      fastingState: checkin.fastingState,
-      hoursFasted: checkin.hoursFasted,
-      sleepHours: checkin.sleepHours,
-      energy: checkin.energy,
       focus: checkin.focus,
       readiness: Math.round(readiness * 100),
       plan: adjustedPlan,
       notes: '',
       workouts: [],
+      cardio: [],
     }
     setActive(s)
     setPlanDraft(null) // draft is now baked into the session
@@ -1368,6 +1463,7 @@ export default function LiftLog() {
           weight: Number(s.weight) || 0,
           reps: Number(s.reps) || 0,
         }
+        if (s.time) set.time = s.time
         if (s.repsLeft !== undefined && s.repsLeft !== '' && s.repsLeft !== null) {
           set.repsLeft = Number(s.repsLeft) || 0
         }
@@ -1398,11 +1494,29 @@ export default function LiftLog() {
     setActive((prev) => (prev ? { ...prev, notes } : prev))
   }
 
+  // End session is now a two-step flow: cardio entry → finalize.
   function endSession() {
     if (!active) return
-    const ended = { ...active, endTime: Date.now() }
+    setView('cardio-entry')
+  }
+
+  function finalizeSession(cardioEntries) {
+    if (!active) return
+    const ended = {
+      ...active,
+      endTime: Date.now(),
+      cardio: cardioEntries || [],
+    }
     const { total, breakdown } = calculateScore(ended, sessions, workouts)
-    const final = { ...ended, score: total, scoreBreakdown: breakdown }
+    const bonus = cardioBonus(ended.cardio)
+    const finalScore = Math.min(100, total + bonus)
+    const final = {
+      ...ended,
+      score: finalScore,
+      scoreBreakdown: breakdown,
+      scoreBase: total,
+      cardioBonusPoints: bonus,
+    }
     setSessions((prev) => [...prev, final])
     setActive(null)
     setCompletedSession(final)
@@ -1545,6 +1659,8 @@ export default function LiftLog() {
       <LogPickerScreen
         muscleGroup={pickerMuscle}
         workouts={workouts}
+        favorites={favorites}
+        onToggleFavorite={toggleFavorite}
         onBack={() => {
           setPickerMuscle(null)
           setView('session')
@@ -1575,6 +1691,14 @@ export default function LiftLog() {
             equipment,
           )
         }
+      />
+    )
+
+  if (view === 'cardio-entry' && active)
+    return (
+      <CardioEntryScreen
+        onCancel={() => setView('session')}
+        onContinue={(entries) => finalizeSession(entries)}
       />
     )
 
@@ -1656,6 +1780,8 @@ export default function LiftLog() {
         exercise={viewingExercise}
         workouts={workouts}
         bodyWeight={bodyWeight}
+        isFavorite={isFavorite(viewingExercise)}
+        onToggleFavorite={() => toggleFavorite(viewingExercise)}
         onBack={() => {
           setViewingExercise(null)
           // Try to go back to the most useful prior view
@@ -2015,13 +2141,9 @@ function PlanCard({
 
 function CheckInScreen({ defaultFocus = [], plan, onBack, onBegin }) {
   const [feel, setFeel] = useState(3)
-  const [fastingState, setFastingState] = useState('FED')
-  const [hoursFasted, setHoursFasted] = useState('')
-  const [sleepHours, setSleepHours] = useState('')
-  const [energy, setEnergy] = useState('NONE')
   const [focus, setFocus] = useState(defaultFocus)
 
-  const readiness = computeReadiness({ feel, fastingState, sleepHours })
+  const readiness = computeReadiness({ feel })
   const difficulty = difficultyTier(readiness)
 
   const toggleFocus = (g) =>
@@ -2031,95 +2153,51 @@ function CheckInScreen({ defaultFocus = [], plan, onBack, onBegin }) {
 
   return (
     <Shell>
-      <TopBar onBack={onBack} title="CHECK-IN" />
+      <SleekBackBar onBack={onBack} title="Check-in" />
 
-      <div className="font-display text-4xl tracking-tight leading-none">
-        PRE-FLIGHT
-      </div>
-      <div className="mt-1 text-[11px] tracking-[0.2em] text-zinc-500">
-        LOG STATE BEFORE YOU LIFT
-      </div>
+      <h1 className="text-4xl font-extrabold tracking-tight leading-none">
+        Pre-flight
+      </h1>
+      <p className="mt-1 text-sm text-zinc-500">
+        Quick check before you lift.
+      </p>
 
       {/* Feel */}
       <div className="mt-6">
-        <Label>HOW DO YOU FEEL?</Label>
+        <div className="text-xs text-zinc-500 font-medium">How do you feel?</div>
         <div className="mt-2 grid grid-cols-5 gap-2">
           {[1, 2, 3, 4, 5].map((n) => (
             <button
               key={n}
               onClick={() => setFeel(n)}
-              className={`py-4 border font-display text-xl tracking-tight ${
+              className={`py-4 rounded-xl text-xl font-bold tabular-nums ${
                 feel === n
-                  ? 'bg-emerald-600 border-emerald-600 text-zinc-950'
-                  : 'border-zinc-800 text-zinc-300'
+                  ? 'bg-emerald-600 text-zinc-950'
+                  : 'bg-zinc-900/60 text-zinc-300 active:bg-zinc-800/60'
               }`}
             >
               {n}
             </button>
           ))}
         </div>
-        <div className="mt-2 grid grid-cols-5 text-[10px] tracking-[0.2em] text-zinc-500 text-center">
-          <span>DRAINED</span>
+        <div className="mt-2 grid grid-cols-5 text-[10px] text-zinc-500 text-center uppercase tracking-wide">
+          <span>Drained</span>
           <span />
-          <span>AVG</span>
+          <span>Avg</span>
           <span />
-          <span>PRIMED</span>
-        </div>
-      </div>
-
-      {/* Fasting */}
-      <div className="mt-6">
-        <Label>FASTING STATE</Label>
-        <div className="mt-2 grid grid-cols-3 gap-2">
-          {FASTING_STATES.map((s) => (
-            <button
-              key={s}
-              onClick={() => setFastingState(s)}
-              className={`py-3 border text-xs tracking-[0.2em] ${
-                fastingState === s
-                  ? 'bg-emerald-600 border-emerald-600 text-zinc-950'
-                  : 'border-zinc-800 text-zinc-300'
-              }`}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Numeric inputs */}
-      <div className="mt-6 grid grid-cols-2 gap-2">
-        <NumField label="HOURS FASTED" value={hoursFasted} onChange={setHoursFasted} />
-        <NumField label="SLEEP HRS" value={sleepHours} onChange={setSleepHours} />
-      </div>
-
-      {/* Energy */}
-      <div className="mt-6">
-        <Label>ENERGY SOURCE</Label>
-        <div className="mt-2 grid grid-cols-4 gap-2">
-          {ENERGY_SOURCES.map((s) => (
-            <button
-              key={s}
-              onClick={() => setEnergy(s)}
-              className={`py-3 border text-[11px] tracking-[0.2em] ${
-                energy === s
-                  ? 'bg-emerald-600 border-emerald-600 text-zinc-950'
-                  : 'border-zinc-800 text-zinc-300'
-              }`}
-            >
-              {s}
-            </button>
-          ))}
+          <span>Primed</span>
         </div>
       </div>
 
       {/* Focus */}
-      <div className="mt-6">
+      <div className="mt-7">
         <div className="flex items-center justify-between">
-          <Label>FOCUS</Label>
+          <div className="text-xs text-zinc-500 font-medium">Focus</div>
           {plan && (
-            <div className={`text-[10px] tracking-[0.2em] ${difficultyColor(difficulty)}`}>
-              {plan.dayType} · {difficulty} · {Math.round(readiness * 100)}%
+            <div
+              className={`text-xs ${difficultyColor(difficulty)}`}
+            >
+              {titleCase(plan.dayType)} · {titleCase(difficulty)}
             </div>
           )}
         </div>
@@ -2128,13 +2206,13 @@ function CheckInScreen({ defaultFocus = [], plan, onBack, onBegin }) {
             <button
               key={g}
               onClick={() => toggleFocus(g)}
-              className={`py-3 border text-[11px] tracking-[0.2em] ${
+              className={`py-3 rounded-xl text-sm font-medium ${
                 focus.includes(g)
-                  ? 'bg-emerald-600 border-emerald-600 text-zinc-950'
-                  : 'border-zinc-800 text-zinc-300'
+                  ? 'bg-emerald-600 text-zinc-950'
+                  : 'bg-zinc-900/60 text-zinc-300 active:bg-zinc-800/60'
               }`}
             >
-              {g.toUpperCase()}
+              {g}
             </button>
           ))}
         </div>
@@ -2142,38 +2220,13 @@ function CheckInScreen({ defaultFocus = [], plan, onBack, onBegin }) {
 
       {/* Begin */}
       <button
-        onClick={() =>
-          onBegin({
-            feel,
-            fastingState,
-            hoursFasted: Number(hoursFasted) || 0,
-            sleepHours: Number(sleepHours) || 0,
-            energy,
-            focus,
-          })
-        }
-        className="mt-8 w-full py-5 bg-emerald-600 text-zinc-950 font-display text-2xl tracking-tight active:bg-emerald-500 flex items-center justify-center gap-2"
+        onClick={() => onBegin({ feel, focus })}
+        className="mt-8 w-full py-5 rounded-2xl bg-emerald-600 text-zinc-950 text-xl font-bold tracking-tight active:bg-emerald-500 flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20"
       >
         <Play size={22} strokeWidth={2.5} />
-        BEGIN SESSION
+        Begin session
       </button>
     </Shell>
-  )
-}
-
-function NumField({ label, value, onChange, placeholder }) {
-  return (
-    <label className="block">
-      <Label>{label}</Label>
-      <input
-        type="number"
-        inputMode="decimal"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="mt-1 w-full bg-zinc-950 border border-zinc-800 px-2 py-3 text-center font-display text-xl tracking-tight focus:outline-none focus:border-zinc-600"
-      />
-    </label>
   )
 }
 
@@ -2256,16 +2309,15 @@ function SessionScreen({
           </span>
           <span className="text-zinc-700">·</span>
           <span className="tabular-nums">Feel {active.feel}</span>
-          <span className="text-zinc-700">·</span>
-          <span>{titleCase(active.fastingState)}</span>
         </div>
       </div>
 
       {/* Stats */}
       <div className="grid grid-cols-3 gap-2">
-        <StatTile
+        <DonutStat
           label="Lifts"
-          value={`${sessionWorkouts.length}/${LIFT_GOAL}`}
+          current={sessionWorkouts.length}
+          goal={LIFT_GOAL}
         />
         <StatTile label="Sets" value={totalSets} />
         <StatTile label="Volume" value={formatVolume(totalVolume)} />
@@ -2417,7 +2469,14 @@ function SessionScreen({
 // LOG PICKER (pick exercise)
 // ============================================================
 
-function LogPickerScreen({ muscleGroup, workouts, onBack, onPick }) {
+function LogPickerScreen({
+  muscleGroup,
+  workouts,
+  favorites = [],
+  onToggleFavorite,
+  onBack,
+  onPick,
+}) {
   const [customMode, setCustomMode] = useState(false)
   const [customName, setCustomName] = useState('')
 
@@ -2432,6 +2491,14 @@ function LogPickerScreen({ muscleGroup, workouts, onBack, onPick }) {
     seen.add(w.exercise)
     customExercises.push(w.exercise)
   }
+
+  // Sort: favorites first (in original order), then the rest
+  const all = [...list, ...customExercises]
+  const favSet = new Set(favorites)
+  const sorted = [
+    ...all.filter((e) => favSet.has(e)),
+    ...all.filter((e) => !favSet.has(e)),
+  ]
 
   function lastSummary(exercise) {
     const last = lastOccurrence(exercise, workouts)
@@ -2448,37 +2515,41 @@ function LogPickerScreen({ muscleGroup, workouts, onBack, onPick }) {
 
   return (
     <Shell>
-      <TopBar
-        onBack={onBack}
-        title={muscleGroup.toUpperCase()}
-      />
+      <SleekBackBar onBack={onBack} title={muscleGroup} />
 
-      <div className="font-display text-4xl tracking-tight leading-none">
-        {muscleGroup.toUpperCase()}
-      </div>
-      <div className="mt-1 text-[11px] tracking-[0.2em] text-zinc-500">
-        PICK AN EXERCISE
-      </div>
+      <h1 className="text-4xl font-extrabold tracking-tight leading-none">
+        {muscleGroup}
+      </h1>
+      <p className="mt-1 text-sm text-zinc-500">Pick an exercise</p>
 
-      <div className="mt-5 border border-zinc-800 divide-y divide-zinc-800">
-        {[...list, ...customExercises].map((ex) => {
+      <div className="mt-5 bg-zinc-900/40 rounded-2xl divide-y divide-zinc-800/60 overflow-hidden">
+        {sorted.map((ex) => {
           const last = lastSummary(ex)
+          const fav = favSet.has(ex)
           return (
-            <button
-              key={ex}
-              onClick={() => onPick(ex)}
-              className="w-full px-3 py-3 flex items-center justify-between text-left active:bg-zinc-900"
-            >
-              <div className="min-w-0 flex-1 pr-2">
-                <div className="text-sm font-semibold">
-                  {ex.toUpperCase()}
+            <div key={ex} className="flex items-stretch">
+              <button
+                onClick={() => onPick(ex)}
+                className="min-w-0 flex-1 text-left px-4 py-3 active:bg-zinc-800/40"
+              >
+                <div className="text-sm font-semibold truncate">{ex}</div>
+                <div className="text-xs text-zinc-500 mt-0.5">
+                  {last ? `Last: ${last}` : 'Never logged'}
                 </div>
-                <div className="text-[10px] tracking-[0.2em] text-zinc-500 mt-0.5">
-                  {last ? `LAST: ${last}` : 'NEVER LOGGED'}
-                </div>
-              </div>
-              <ChevronRight size={16} className="text-zinc-500 shrink-0" />
-            </button>
+              </button>
+              <button
+                onClick={() => onToggleFavorite?.(ex)}
+                className="px-3 active:opacity-70 shrink-0"
+                aria-label={fav ? 'Unstar' : 'Star'}
+              >
+                <Star
+                  size={16}
+                  className={
+                    fav ? 'text-amber-400 fill-amber-400' : 'text-zinc-600'
+                  }
+                />
+              </button>
+            </div>
           )
         })}
       </div>
@@ -2486,22 +2557,24 @@ function LogPickerScreen({ muscleGroup, workouts, onBack, onPick }) {
       {!customMode && (
         <button
           onClick={() => setCustomMode(true)}
-          className="mt-4 w-full py-4 border border-dashed border-zinc-700 text-zinc-300 flex items-center justify-center gap-2 active:bg-zinc-900"
+          className="mt-4 w-full py-4 rounded-2xl border border-dashed border-zinc-700 text-zinc-300 flex items-center justify-center gap-2 active:bg-zinc-900/40"
         >
           <Plus size={16} />
-          <span className="text-[11px] tracking-[0.2em]">CUSTOM EXERCISE</span>
+          <span className="text-sm font-medium">Custom exercise</span>
         </button>
       )}
 
       {customMode && (
-        <div className="mt-4 border border-zinc-800 p-3">
-          <Label>CUSTOM EXERCISE NAME</Label>
+        <div className="mt-4 bg-zinc-900/60 rounded-2xl p-3">
+          <div className="text-xs text-zinc-500 font-medium">
+            Custom exercise name
+          </div>
           <input
             type="text"
             value={customName}
             onChange={(e) => setCustomName(e.target.value)}
-            placeholder="E.G. CABLE PRESS"
-            className="mt-2 w-full bg-zinc-950 border border-zinc-800 px-2 py-3 text-sm focus:outline-none focus:border-zinc-600 placeholder:text-zinc-600"
+            placeholder="e.g. Cable press"
+            className="mt-2 w-full bg-zinc-950/60 rounded-xl px-3 py-3 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-600 placeholder:text-zinc-600 ring-1 ring-zinc-800/50"
             autoFocus
           />
           <div className="mt-2 grid grid-cols-2 gap-2">
@@ -2510,15 +2583,15 @@ function LogPickerScreen({ muscleGroup, workouts, onBack, onPick }) {
                 setCustomMode(false)
                 setCustomName('')
               }}
-              className="py-3 border border-zinc-800 text-[11px] tracking-[0.2em]"
+              className="py-3 rounded-xl bg-zinc-800/60 text-sm font-medium"
             >
-              CANCEL
+              Cancel
             </button>
             <button
               onClick={submitCustom}
-              className="py-3 bg-emerald-600 text-zinc-950 text-[11px] tracking-[0.2em] font-bold"
+              className="py-3 rounded-xl bg-emerald-600 text-zinc-950 text-sm font-bold active:bg-emerald-500"
             >
-              CONTINUE
+              Continue
             </button>
           </div>
         </div>
@@ -2622,7 +2695,7 @@ function LogEntryScreen({
     const r = Number(reps) || 0
     const rL = Number(repsLeft) || 0
     if (r <= 0 && rL <= 0) return
-    const newSet = { weight: w, reps: r }
+    const newSet = { weight: w, reps: r, time: Date.now() }
     if (unilateral) newSet.repsLeft = rL
     const next = [...completed, newSet]
     setCompleted(next)
@@ -2970,6 +3043,11 @@ function SessionCompleteScreen({
           <div className="mt-1 text-sm font-semibold text-emerald-400">
             {titleCase(scoreLabel(session.score))}
           </div>
+          {session.cardioBonusPoints > 0 && (
+            <div className="mt-1 text-[11px] text-emerald-400/80 font-mono tabular-nums">
+              {session.scoreBase} base + {session.cardioBonusPoints} cardio
+            </div>
+          )}
         </div>
         <Award size={36} className="text-emerald-500/60" />
       </div>
@@ -2983,6 +3061,34 @@ function SessionCompleteScreen({
         <StatTile label="Lifts" value={sessionWorkouts.length} />
         <StatTile label="Volume" value={formatVolume(totalVolume)} />
       </div>
+
+      {/* Cardio entries */}
+      {session.cardio && session.cardio.length > 0 && (
+        <div className="mt-4">
+          <div className="text-xs text-zinc-500 font-medium flex items-center gap-1.5">
+            <Bike size={12} />
+            Cardio
+          </div>
+          <div className="mt-2 bg-zinc-900/60 rounded-2xl divide-y divide-zinc-800/60 overflow-hidden">
+            {session.cardio.map((c) => (
+              <div
+                key={c.id}
+                className="px-4 py-2.5 flex items-center justify-between text-sm"
+              >
+                <span className="font-medium">
+                  {c.type}{' '}
+                  <span className="text-zinc-500 font-normal">
+                    · {c.intensity}
+                  </span>
+                </span>
+                <span className="font-mono tabular-nums text-zinc-400">
+                  {c.durationMin} min
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Headline */}
       <div className="mt-6">
@@ -3372,19 +3478,35 @@ function SessionDetailScreen({
         <Stat label="FEEL" value={session.feel} border />
       </div>
 
-      {/* Context cards */}
-      <div className="mt-3 grid grid-cols-3 border border-zinc-800">
-        <ContextCell
-          label="FASTING"
-          value={`${session.fastingState}${session.hoursFasted ? ` ${session.hoursFasted}H` : ''}`}
-        />
-        <ContextCell label="ENERGY" value={session.energy} border />
-        <ContextCell
-          label="SLEEP"
-          value={session.sleepHours ? `${session.sleepHours}H` : '—'}
-          border
-        />
-      </div>
+      {/* Cardio (if logged) */}
+      {session.cardio && session.cardio.length > 0 && (
+        <div className="mt-4">
+          <Label>CARDIO</Label>
+          <div className="mt-2 border border-zinc-800 divide-y divide-zinc-800">
+            {session.cardio.map((c) => (
+              <div
+                key={c.id}
+                className="px-3 py-2 flex items-center justify-between text-xs"
+              >
+                <span>
+                  {c.type.toUpperCase()} · {c.intensity.toUpperCase()}
+                </span>
+                <span className="tabular-nums text-zinc-400">
+                  {c.durationMin} MIN
+                </span>
+              </div>
+            ))}
+            {session.cardioBonusPoints > 0 && (
+              <div className="px-3 py-2 bg-emerald-950/30 text-[10px] tracking-[0.2em] text-emerald-400 flex items-center justify-between">
+                <span>CARDIO BONUS</span>
+                <span className="tabular-nums font-bold">
+                  +{session.cardioBonusPoints}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Notes */}
       <div className="mt-5">
@@ -3575,7 +3697,14 @@ function AllLiftsScreen({ workouts, onBack, onDelete, onOpenExercise, onEdit }) 
 // EXERCISE DETAIL
 // ============================================================
 
-function ExerciseDetailScreen({ exercise, workouts, bodyWeight = 0, onBack }) {
+function ExerciseDetailScreen({
+  exercise,
+  workouts,
+  bodyWeight = 0,
+  isFavorite = false,
+  onToggleFavorite,
+  onBack,
+}) {
   const matches = workouts.filter((w) => w.exercise === exercise)
   const sorted = [...matches].sort((a, b) => b.date - a.date)
   const muscleGroup = sorted[0]?.muscleGroup || ''
@@ -3610,14 +3739,34 @@ function ExerciseDetailScreen({ exercise, workouts, bodyWeight = 0, onBack }) {
     <Shell>
       <TopBar onBack={onBack} title="EXERCISE" />
 
-      <div className="font-display text-3xl tracking-tight leading-none">
-        {exercise.toUpperCase()}
-      </div>
-      {muscleGroup && (
-        <div className="mt-1 text-[11px] tracking-[0.2em] text-zinc-500">
-          {muscleGroup.toUpperCase()}
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="font-display text-3xl tracking-tight leading-none">
+            {exercise.toUpperCase()}
+          </div>
+          {muscleGroup && (
+            <div className="mt-1 text-[11px] tracking-[0.2em] text-zinc-500">
+              {muscleGroup.toUpperCase()}
+            </div>
+          )}
         </div>
-      )}
+        {onToggleFavorite && (
+          <button
+            onClick={onToggleFavorite}
+            className="p-2 -mt-1 -mr-2 active:opacity-70"
+            aria-label={isFavorite ? 'Unstar' : 'Star'}
+          >
+            <Star
+              size={22}
+              className={
+                isFavorite
+                  ? 'text-amber-400 fill-amber-400'
+                  : 'text-zinc-600'
+              }
+            />
+          </button>
+        )}
+      </div>
 
       <div className="mt-4 grid grid-cols-2 border border-zinc-800">
         <Stat
@@ -3744,13 +3893,29 @@ function SettingsScreen({
   }
 
   function buildAndDownloadCSV() {
-    const cutoff =
-      csvRange > 0 ? Date.now() - csvRange * 86400000 : 0
-    const filtered = workouts
-      .filter((w) => w.date >= cutoff)
-      .sort((a, b) => a.date - b.date)
+    const cutoff = csvRange > 0 ? Date.now() - csvRange * 86400000 : 0
+
+    // Map workout id → session for attaching header info to each row
+    const workoutToSession = new Map()
+    for (const s of sessions) {
+      for (const wid of s.workouts || []) {
+        workoutToSession.set(wid, s)
+      }
+    }
+    // Map session id → session for cardio rows
+    const sessionsById = new Map(sessions.map((s) => [s.id, s]))
+
     const header = [
-      'date',
+      'session_id',
+      'session_start',
+      'session_feel',
+      'session_focus',
+      'session_readiness',
+      'session_score',
+      'session_cardio_bonus',
+      'kind',
+      'workout_date',
+      'set_time',
       'exercise',
       'muscle_group',
       'equipment',
@@ -3758,26 +3923,83 @@ function SettingsScreen({
       'weight',
       'reps',
       'reps_left',
+      'cardio_type',
+      'cardio_duration_min',
+      'cardio_intensity',
     ]
     const lines = [header.join(',')]
-    for (const w of filtered) {
+
+    function sessionCols(s) {
+      if (!s)
+        return ['', '', '', '', '', '', '']
+      return [
+        csvEscape(s.id),
+        new Date(s.startTime).toISOString(),
+        s.feel ?? '',
+        csvEscape((s.focus || []).join('|')),
+        s.readiness ?? '',
+        s.score ?? '',
+        s.cardioBonusPoints ?? '',
+      ]
+    }
+
+    // Lift rows
+    const filteredWorkouts = workouts
+      .filter((w) => w.date >= cutoff)
+      .sort((a, b) => a.date - b.date)
+    for (const w of filteredWorkouts) {
+      const s = workoutToSession.get(w.id)
       const equip = exerciseEquip(w.exercise, w.equipment)
       const dateStr = new Date(w.date).toISOString()
-      ;(w.sets || []).forEach((s, i) => {
+      ;(w.sets || []).forEach((set, i) => {
         lines.push(
           [
+            ...sessionCols(s),
+            'lift',
             dateStr,
+            set.time ? new Date(set.time).toISOString() : '',
             csvEscape(w.exercise),
             csvEscape(w.muscleGroup),
             equip,
             i + 1,
-            s.weight ?? 0,
-            s.reps ?? 0,
-            s.repsLeft ?? '',
+            set.weight ?? 0,
+            set.reps ?? 0,
+            set.repsLeft ?? '',
+            '',
+            '',
+            '',
           ].join(','),
         )
       })
     }
+
+    // Cardio rows
+    const filteredSessions = sessions
+      .filter((s) => s.endTime && s.endTime >= cutoff)
+      .sort((a, b) => a.startTime - b.startTime)
+    for (const s of filteredSessions) {
+      for (const c of s.cardio || []) {
+        lines.push(
+          [
+            ...sessionCols(s),
+            'cardio',
+            new Date(s.startTime).toISOString(),
+            c.time ? new Date(c.time).toISOString() : '',
+            csvEscape(c.type),
+            '',
+            'cardio',
+            1,
+            '',
+            '',
+            '',
+            csvEscape(c.type),
+            c.durationMin ?? 0,
+            csvEscape(c.intensity),
+          ].join(','),
+        )
+      }
+    }
+
     const csv = lines.join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
@@ -4055,6 +4277,7 @@ function EditWorkoutScreen({ workout, onCancel, onSave, onDelete }) {
     (workout.sets || []).map((s) => ({
       weight: String(s.weight ?? ''),
       reps: String(s.reps ?? ''),
+      time: s.time, // preserve original timestamp
     })),
   )
 
@@ -4071,6 +4294,7 @@ function EditWorkoutScreen({ workout, onCancel, onSave, onDelete }) {
       {
         weight: last ? last.weight : '0',
         reps: last ? last.reps : '10',
+        time: Date.now(),
       },
     ])
   }
@@ -4081,10 +4305,14 @@ function EditWorkoutScreen({ workout, onCancel, onSave, onDelete }) {
 
   function save() {
     const cleaned = sets
-      .map((s) => ({
-        weight: Number(s.weight) || 0,
-        reps: Number(s.reps) || 0,
-      }))
+      .map((s) => {
+        const out = {
+          weight: Number(s.weight) || 0,
+          reps: Number(s.reps) || 0,
+        }
+        if (s.time) out.time = s.time
+        return out
+      })
       .filter((s) => s.reps > 0)
     if (cleaned.length === 0) {
       const ok = confirm(
@@ -4547,6 +4775,160 @@ function PlanEditorScreen({ plan, isDraft, onBack, onSave, onReset }) {
           Save plan
         </button>
       </div>
+    </Shell>
+  )
+}
+
+// ============================================================
+// CARDIO ENTRY (at end of session, before scoring)
+// ============================================================
+
+function CardioEntryScreen({ onCancel, onContinue }) {
+  const [entries, setEntries] = useState([])
+  const [type, setType] = useState('Bike')
+  const [duration, setDuration] = useState('')
+  const [intensity, setIntensity] = useState('Average')
+
+  function addEntry() {
+    const dur = Number(duration) || 0
+    if (dur <= 0) return
+    setEntries((prev) => [
+      ...prev,
+      { id: uid(), type, durationMin: dur, intensity, time: Date.now() },
+    ])
+    setDuration('')
+  }
+
+  function removeEntry(id) {
+    setEntries((prev) => prev.filter((e) => e.id !== id))
+  }
+
+  const bonus = cardioBonus(entries)
+
+  return (
+    <Shell>
+      <SleekBackBar onBack={onCancel} title="Cardio" />
+
+      <h1 className="text-4xl font-extrabold tracking-tight leading-none">
+        Cardio?
+      </h1>
+      <p className="mt-1 text-sm text-zinc-500">
+        Did you also do cardio today? Optional — adds a small bonus to your
+        score.
+      </p>
+
+      {/* Existing entries */}
+      {entries.length > 0 && (
+        <div className="mt-5 bg-zinc-900/40 rounded-2xl divide-y divide-zinc-800/60 overflow-hidden">
+          {entries.map((e) => (
+            <div
+              key={e.id}
+              className="px-4 py-3 flex items-center justify-between gap-2"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold">
+                  {e.type} · {e.intensity}
+                </div>
+                <div className="text-xs text-zinc-500 mt-0.5 tabular-nums">
+                  {e.durationMin} min
+                </div>
+              </div>
+              <button
+                onClick={() => removeEntry(e.id)}
+                className="p-2 text-zinc-600 active:text-red-400"
+                aria-label="Remove"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+          {bonus > 0 && (
+            <div className="px-4 py-2.5 bg-emerald-950/30 text-xs text-emerald-400 flex items-center justify-between">
+              <span className="font-medium">Cardio bonus</span>
+              <span className="font-mono tabular-nums font-bold">
+                +{bonus}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Add entry */}
+      <div className="mt-5 bg-zinc-900/60 rounded-2xl p-4 space-y-4">
+        <div>
+          <div className="text-xs text-zinc-500 font-medium">Type</div>
+          <div className="mt-2 grid grid-cols-4 gap-2">
+            {CARDIO_TYPES.map((t) => (
+              <button
+                key={t}
+                onClick={() => setType(t)}
+                className={`py-2 rounded-lg text-xs font-medium ${
+                  type === t
+                    ? 'bg-emerald-600 text-zinc-950'
+                    : 'bg-zinc-950/40 text-zinc-300 active:bg-zinc-800/60'
+                }`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="text-xs text-zinc-500 font-medium">Intensity</div>
+          <div className="mt-2 grid grid-cols-3 gap-2">
+            {CARDIO_INTENSITIES.map((i) => (
+              <button
+                key={i}
+                onClick={() => setIntensity(i)}
+                className={`py-3 rounded-lg text-sm font-medium ${
+                  intensity === i
+                    ? 'bg-emerald-600 text-zinc-950'
+                    : 'bg-zinc-950/40 text-zinc-300 active:bg-zinc-800/60'
+                }`}
+              >
+                {i}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="text-xs text-zinc-500 font-medium">
+            Duration (minutes)
+          </div>
+          <div className="mt-2 flex items-center gap-2">
+            <input
+              type="number"
+              inputMode="numeric"
+              value={duration}
+              onChange={(e) => setDuration(e.target.value)}
+              placeholder="30"
+              className="flex-1 bg-zinc-950/60 rounded-xl px-3 py-3 text-center font-mono tabular-nums text-xl font-bold ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+            />
+            <button
+              onClick={addEntry}
+              disabled={!duration || Number(duration) <= 0}
+              className={`px-4 py-3 rounded-xl text-sm font-bold flex items-center gap-1 ${
+                duration && Number(duration) > 0
+                  ? 'bg-emerald-600 text-zinc-950 active:bg-emerald-500'
+                  : 'bg-zinc-800/60 text-zinc-600'
+              }`}
+            >
+              <Plus size={14} />
+              Add
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Continue */}
+      <button
+        onClick={() => onContinue(entries)}
+        className="mt-6 w-full py-5 rounded-2xl bg-emerald-600 text-zinc-950 text-xl font-bold tracking-tight active:bg-emerald-500 shadow-lg shadow-emerald-600/20"
+      >
+        {entries.length === 0 ? 'Skip — no cardio' : 'Continue to score'}
+      </button>
     </Shell>
   )
 }
