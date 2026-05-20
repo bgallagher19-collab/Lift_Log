@@ -39,6 +39,8 @@ const STORAGE = {
   workouts: 'liftlog:workouts',
   sessions: 'liftlog:sessions',
   active: 'liftlog:active',
+  bodyWeight: 'liftlog:bodyWeight',
+  planDraft: 'liftlog:planDraft',
 }
 
 const MUSCLE_GROUPS = ['Chest', 'Back', 'Shoulders', 'Arms', 'Legs', 'Core']
@@ -107,6 +109,89 @@ const EXERCISES = {
 }
 
 const LOWER_BODY_EXTRAS = new Set(['Deadlift', 'Romanian Deadlift'])
+
+// Equipment types
+const EQUIPMENT_TYPES = [
+  'barbell',
+  'dumbbell',
+  'cable',
+  'machine',
+  'bodyweight',
+]
+const EQUIPMENT_LABEL = {
+  barbell: 'Barbell',
+  dumbbell: 'Dumbbell',
+  cable: 'Cable',
+  machine: 'Machine',
+  bodyweight: 'Bodyweight',
+  unspecified: 'Other',
+}
+
+// Default equipment type per built-in exercise
+const EXERCISE_META = {
+  // Chest
+  'Bench Press': { equip: 'barbell' },
+  'Incline Bench Press': { equip: 'barbell' },
+  'Dumbbell Bench Press': { equip: 'dumbbell' },
+  'Incline Dumbbell Press': { equip: 'dumbbell' },
+  'Dumbbell Fly': { equip: 'dumbbell' },
+  'Cable Fly': { equip: 'cable' },
+  'Push-Up': { equip: 'bodyweight' },
+  Dip: { equip: 'bodyweight' },
+  // Back
+  Deadlift: { equip: 'barbell' },
+  'Pull-Up': { equip: 'bodyweight' },
+  'Barbell Row': { equip: 'barbell' },
+  'Bent-Over Row': { equip: 'barbell' },
+  'Lat Pulldown': { equip: 'cable' },
+  'Seated Cable Row': { equip: 'cable' },
+  'T-Bar Row': { equip: 'machine' },
+  'Face Pull': { equip: 'cable' },
+  // Shoulders
+  'Overhead Press': { equip: 'barbell' },
+  'Dumbbell Shoulder Press': { equip: 'dumbbell' },
+  'Lateral Raise': { equip: 'dumbbell' },
+  'Front Raise': { equip: 'dumbbell' },
+  'Rear Delt Fly': { equip: 'dumbbell' },
+  'Arnold Press': { equip: 'dumbbell' },
+  'Upright Row': { equip: 'barbell' },
+  Shrug: { equip: 'barbell' },
+  // Arms
+  'Barbell Curl': { equip: 'barbell' },
+  'Dumbbell Curl': { equip: 'dumbbell' },
+  'Hammer Curl': { equip: 'dumbbell' },
+  'Preacher Curl': { equip: 'barbell' },
+  'Tricep Pushdown': { equip: 'cable' },
+  'Skull Crusher': { equip: 'barbell' },
+  'Overhead Tricep Extension': { equip: 'dumbbell' },
+  'Close-Grip Bench': { equip: 'barbell' },
+  // Legs
+  Squat: { equip: 'barbell' },
+  'Front Squat': { equip: 'barbell' },
+  'Leg Press': { equip: 'machine' },
+  'Romanian Deadlift': { equip: 'barbell' },
+  Lunge: { equip: 'dumbbell' },
+  'Leg Curl': { equip: 'machine' },
+  'Leg Extension': { equip: 'machine' },
+  'Calf Raise': { equip: 'machine' },
+  // Core
+  Plank: { equip: 'bodyweight' },
+  'Hanging Leg Raise': { equip: 'bodyweight' },
+  'Russian Twist': { equip: 'bodyweight' },
+  'Ab Wheel Rollout': { equip: 'bodyweight' },
+  'Cable Crunch': { equip: 'cable' },
+  'Sit-Up': { equip: 'bodyweight' },
+  'Mountain Climber': { equip: 'bodyweight' },
+  'Hollow Hold': { equip: 'bodyweight' },
+}
+
+function exerciseEquip(name, override) {
+  if (override) return override
+  return EXERCISE_META[name]?.equip || 'unspecified'
+}
+
+const isBodyweight = (equip) => equip === 'bodyweight'
+const isBarbell = (equip) => equip === 'barbell'
 
 const FEEL_LABELS = ['DRAINED', '', 'AVG', '', 'PRIMED']
 const FASTING_STATES = ['FASTED', 'PARTIAL', 'FED']
@@ -192,21 +277,70 @@ function clearKey(key) {
 const isLowerBody = (exercise, muscleGroup) =>
   muscleGroup === 'Legs' || LOWER_BODY_EXTRAS.has(exercise)
 
-const workoutVolume = (w) =>
-  (w.sets || []).reduce(
-    (sum, s) => sum + (Number(s.weight) || 0) * (Number(s.reps) || 0),
-    0,
-  )
+// Total reps for a set, summing both sides if unilateral
+const setReps = (s) => (Number(s.reps) || 0) + (Number(s.repsLeft) || 0)
 
-const bestSetWeight = (w) =>
-  (w.sets || []).reduce(
-    (best, s) =>
-      Math.max(best, (Number(s.weight) || 0) * (Number(s.reps) || 0)),
+// Effective per-rep weight. For Bodyweight exercises, multiply by (bodyWeight
+// + addedLoad) so push-ups and pull-ups actually contribute volume.
+function setEffectiveWeight(s, equip, bodyWeight) {
+  const w = Number(s.weight) || 0
+  if (isBodyweight(equip)) {
+    const bw = Number(bodyWeight) || 0
+    return bw > 0 ? bw + w : Math.max(1, w) // 1 keeps reps countable when BW unset
+  }
+  return w
+}
+
+function workoutVolume(w, bodyWeight = 0) {
+  const equip = exerciseEquip(w.exercise, w.equipment)
+  return (w.sets || []).reduce(
+    (sum, s) => sum + setEffectiveWeight(s, equip, bodyWeight) * setReps(s),
     0,
   )
+}
+
+function bestSetWeight(w, bodyWeight = 0) {
+  const equip = exerciseEquip(w.exercise, w.equipment)
+  return (w.sets || []).reduce(
+    (best, s) =>
+      Math.max(best, setEffectiveWeight(s, equip, bodyWeight) * setReps(s)),
+    0,
+  )
+}
 
 const heaviestWeight = (w) =>
   (w.sets || []).reduce((best, s) => Math.max(best, Number(s.weight) || 0), 0)
+
+// Epley 1RM estimate: weight × (1 + reps / 30)
+function epley1RM(weight, reps) {
+  if (weight <= 0 || reps <= 0) return 0
+  if (reps === 1) return weight
+  return weight * (1 + reps / 30)
+}
+
+function workoutBest1RM(w, bodyWeight = 0) {
+  const equip = exerciseEquip(w.exercise, w.equipment)
+  let best = 0
+  for (const s of w.sets || []) {
+    const ew = setEffectiveWeight(s, equip, bodyWeight)
+    const r = setReps(s)
+    const e = epley1RM(ew, r)
+    if (e > best) best = e
+  }
+  return best
+}
+
+// Human-readable summary of one set, e.g. "10×135", "8R/7L×50", "12 · BW"
+function formatSet(set, equip) {
+  const repsPart =
+    set.repsLeft !== undefined && set.repsLeft !== null
+      ? `${set.reps}R/${set.repsLeft}L`
+      : `${set.reps}`
+  if (isBodyweight(equip) && (!set.weight || Number(set.weight) === 0)) {
+    return `${repsPart} · BW`
+  }
+  return `${repsPart}×${set.weight}`
+}
 
 const scoreLabel = (score) =>
   SCORE_TIERS.find((t) => score >= t.min)?.label || 'LIGHT'
@@ -1148,12 +1282,16 @@ export default function LiftLog() {
   const [viewingExercise, setViewingExercise] = useState(null)
   const [editingWorkoutId, setEditingWorkoutId] = useState(null)
   const [editReturnView, setEditReturnView] = useState('session')
+  const [bodyWeight, setBodyWeight] = useState(0)
+  const [planDraft, setPlanDraft] = useState(null)
 
   // Load from localStorage on mount
   useEffect(() => {
     setWorkouts(loadJSON(STORAGE.workouts, []))
     setSessions(loadJSON(STORAGE.sessions, []))
     setActive(loadJSON(STORAGE.active, null))
+    setBodyWeight(Number(loadJSON(STORAGE.bodyWeight, 0)) || 0)
+    setPlanDraft(loadJSON(STORAGE.planDraft, null))
     setLoaded(true)
   }, [])
 
@@ -1171,6 +1309,15 @@ export default function LiftLog() {
     if (active) saveJSON(STORAGE.active, active)
     else clearKey(STORAGE.active)
   }, [active, loaded])
+  useEffect(() => {
+    if (!loaded) return
+    saveJSON(STORAGE.bodyWeight, bodyWeight)
+  }, [bodyWeight, loaded])
+  useEffect(() => {
+    if (!loaded) return
+    if (planDraft) saveJSON(STORAGE.planDraft, planDraft)
+    else clearKey(STORAGE.planDraft)
+  }, [planDraft, loaded])
 
   // Timer tick while in active session
   useEffect(() => {
@@ -1179,15 +1326,17 @@ export default function LiftLog() {
     return () => clearInterval(id)
   }, [active, view])
 
-  // Today's suggested plan — recomputed when workouts change
+  // Today's suggested plan — recomputed when workouts change.
+  // A draft (user-edited plan) overrides this until session start.
   const todaysPlan = useMemo(() => suggestSessionPlan(workouts), [workouts])
+  const resolvedPlan = planDraft || todaysPlan
 
   // -------------- handlers --------------
 
   function startSession(checkin) {
     // Snapshot the plan into the session so it doesn't shift mid-session
-    // as workouts get logged
-    const snapshot = suggestSessionPlan(workouts)
+    // as workouts get logged. Prefer the user's edited draft if present.
+    const snapshot = planDraft || suggestSessionPlan(workouts)
     const readiness = computeReadiness(checkin)
     const adjustedPlan = applyDifficulty(snapshot, readiness)
     const s = {
@@ -1206,19 +1355,25 @@ export default function LiftLog() {
       workouts: [],
     }
     setActive(s)
+    setPlanDraft(null) // draft is now baked into the session
     setNow(Date.now())
     setView('session')
   }
 
-  function logWorkout(exercise, muscleGroup, sets) {
+  function logWorkout(exercise, muscleGroup, sets, equipment) {
     const filteredSets = sets
-      .filter((s) => Number(s.weight) >= 0 && Number(s.reps) > 0)
-      .map((s) => ({
-        weight: Number(s.weight) || 0,
-        reps: Number(s.reps) || 0,
-      }))
+      .filter((s) => Number(s.weight) >= 0 && (Number(s.reps) > 0 || Number(s.repsLeft) > 0))
+      .map((s) => {
+        const set = {
+          weight: Number(s.weight) || 0,
+          reps: Number(s.reps) || 0,
+        }
+        if (s.repsLeft !== undefined && s.repsLeft !== '' && s.repsLeft !== null) {
+          set.repsLeft = Number(s.repsLeft) || 0
+        }
+        return set
+      })
     if (filteredSets.length === 0) {
-      // Nothing to log
       setView('session')
       return
     }
@@ -1227,6 +1382,7 @@ export default function LiftLog() {
       date: Date.now(),
       exercise,
       muscleGroup,
+      equipment: equipment || exerciseEquip(exercise),
       sets: filteredSets,
     }
     setWorkouts((prev) => [...prev, w])
@@ -1285,6 +1441,14 @@ export default function LiftLog() {
     )
   }
 
+  function deleteSession(id) {
+    const s = sessions.find((x) => x.id === id)
+    if (!s) return
+    const workoutIds = new Set(s.workouts || [])
+    setSessions((prev) => prev.filter((x) => x.id !== id))
+    setWorkouts((prev) => prev.filter((w) => !workoutIds.has(w.id)))
+  }
+
   function importData(nextWorkouts, nextSessions) {
     setWorkouts(nextWorkouts)
     setSessions(nextSessions)
@@ -1305,7 +1469,8 @@ export default function LiftLog() {
         active={active}
         workouts={workouts}
         sessions={sessions}
-        plan={todaysPlan}
+        plan={resolvedPlan}
+        planIsDraft={!!planDraft}
         onStart={() => setView('checkin')}
         onResume={() => {
           setNow(Date.now())
@@ -1318,14 +1483,32 @@ export default function LiftLog() {
           setView('exercise-detail')
         }}
         onSettings={() => setView('settings')}
+        onEditPlan={() => setView('plan-editor')}
+      />
+    )
+
+  if (view === 'plan-editor')
+    return (
+      <PlanEditorScreen
+        plan={resolvedPlan}
+        isDraft={!!planDraft}
+        onBack={() => setView('home')}
+        onSave={(edited) => {
+          setPlanDraft(edited)
+          setView('home')
+        }}
+        onReset={() => {
+          setPlanDraft(null)
+          setView('home')
+        }}
       />
     )
 
   if (view === 'checkin')
     return (
       <CheckInScreen
-        defaultFocus={todaysPlan.focus}
-        plan={todaysPlan}
+        defaultFocus={resolvedPlan.focus}
+        plan={resolvedPlan}
         onBack={() => setView('home')}
         onBegin={startSession}
       />
@@ -1379,12 +1562,18 @@ export default function LiftLog() {
         exercise={entryExercise.exercise}
         muscleGroup={entryExercise.muscleGroup}
         workouts={workouts}
+        bodyWeight={bodyWeight}
         onBack={() => {
           setEntryExercise(null)
           setView('log-picker')
         }}
-        onFinish={(sets) =>
-          logWorkout(entryExercise.exercise, entryExercise.muscleGroup, sets)
+        onFinish={(sets, equipment) =>
+          logWorkout(
+            entryExercise.exercise,
+            entryExercise.muscleGroup,
+            sets,
+            equipment,
+          )
         }
       />
     )
@@ -1434,6 +1623,11 @@ export default function LiftLog() {
           setViewingExercise(ex)
           setView('exercise-detail')
         }}
+        onDelete={() => {
+          deleteSession(session.id)
+          setViewingSessionId(null)
+          setView('scoreboard')
+        }}
       />
     )
   }
@@ -1461,6 +1655,7 @@ export default function LiftLog() {
       <ExerciseDetailScreen
         exercise={viewingExercise}
         workouts={workouts}
+        bodyWeight={bodyWeight}
         onBack={() => {
           setViewingExercise(null)
           // Try to go back to the most useful prior view
@@ -1474,6 +1669,8 @@ export default function LiftLog() {
       <SettingsScreen
         workouts={workouts}
         sessions={sessions}
+        bodyWeight={bodyWeight}
+        onChangeBodyWeight={setBodyWeight}
         onBack={() => setView('home')}
         onImport={importData}
         onReset={resetAllData}
@@ -1534,12 +1731,14 @@ function HomeScreen({
   workouts,
   sessions,
   plan,
+  planIsDraft,
   onStart,
   onResume,
   onSessions,
   onAllLifts,
   onExercise,
   onSettings,
+  onEditPlan,
 }) {
   const weekAgo = Date.now() - 7 * 86400000
   const weekWorkouts = workouts.filter((w) => w.date >= weekAgo)
@@ -1611,7 +1810,11 @@ function HomeScreen({
 
       {/* Today's plan */}
       {!active && plan && plan.exercises.length > 0 && (
-        <PlanCard plan={plan} title="Today's plan" />
+        <PlanCard
+          plan={plan}
+          title={planIsDraft ? "Today's plan · edited" : "Today's plan"}
+          onEdit={onEditPlan}
+        />
       )}
 
       {/* Recent exercises */}
@@ -1696,6 +1899,7 @@ function PlanCard({
   title = 'Plan',
   completedExercises = null,
   onPickExercise = null,
+  onEdit = null,
 }) {
   const interactive = typeof onPickExercise === 'function'
   const day = titleCase(plan.dayType)
@@ -1704,8 +1908,20 @@ function PlanCard({
     <div className="mt-7">
       <div className="flex items-center justify-between">
         <div className="text-xs text-zinc-500 font-medium">{title}</div>
-        <div className="text-xs text-zinc-500 tabular-nums">
-          ~{plan.estimatedMinutes} min
+        <div className="flex items-center gap-2">
+          <div className="text-xs text-zinc-500 tabular-nums">
+            ~{plan.estimatedMinutes} min
+          </div>
+          {onEdit && (
+            <button
+              onClick={onEdit}
+              className="px-2 py-1 text-xs font-medium text-zinc-300 bg-zinc-900/60 rounded-md active:bg-zinc-800/60 flex items-center gap-1"
+              aria-label="Edit plan"
+            >
+              <Pencil size={11} />
+              Edit
+            </button>
+          )}
         </div>
       </div>
       <div className="mt-2 bg-emerald-950/40 rounded-2xl overflow-hidden ring-1 ring-emerald-900/40">
@@ -2160,7 +2376,7 @@ function SessionScreen({
                       key={i}
                       className="text-xs px-2 py-0.5 bg-zinc-800/60 rounded-md font-mono tabular-nums text-zinc-200"
                     >
-                      {s.reps}×{s.weight}
+                      {formatSet(s, exerciseEquip(w.exercise, w.equipment))}
                     </span>
                   ))}
                 </div>
@@ -2168,10 +2384,11 @@ function SessionScreen({
               <div className="flex items-center gap-1 shrink-0">
                 <button
                   onClick={() => onEditWorkout(w.id)}
-                  className="p-2 text-zinc-500 active:text-zinc-100"
+                  className="px-2.5 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-800/60 rounded-md active:bg-zinc-700/60 flex items-center gap-1"
                   aria-label="Edit"
                 >
-                  <Pencil size={14} />
+                  <Pencil size={12} />
+                  Edit
                 </button>
                 <button
                   onClick={() => onDeleteWorkout(w.id)}
@@ -2219,7 +2436,8 @@ function LogPickerScreen({ muscleGroup, workouts, onBack, onPick }) {
   function lastSummary(exercise) {
     const last = lastOccurrence(exercise, workouts)
     if (!last) return null
-    return last.sets.map((s) => `${s.reps}×${s.weight}`).join(' / ')
+    const equip = exerciseEquip(exercise, last.equipment)
+    return last.sets.map((s) => formatSet(s, equip)).join(' / ')
   }
 
   function submitCustom() {
@@ -2319,6 +2537,7 @@ function LogEntryScreen({
   exercise,
   muscleGroup,
   workouts,
+  bodyWeight,
   onBack,
   onFinish,
 }) {
@@ -2326,12 +2545,28 @@ function LogEntryScreen({
   const lastWorkout = lastOccurrence(exercise, workouts)
   const lastSets = lastWorkout?.sets || []
 
+  // Equipment: previous workout's equipment, else metadata default, else barbell
+  const initialEquipment =
+    lastWorkout?.equipment ||
+    EXERCISE_META[exercise]?.equip ||
+    'barbell'
+  const [equipment, setEquipment] = useState(initialEquipment)
+
+  // L/R toggle — auto-on if the previous workout had repsLeft
+  const initialUnilateral = lastSets.some(
+    (s) => s.repsLeft !== undefined && s.repsLeft !== null,
+  )
+  const [unilateral, setUnilateral] = useState(initialUnilateral)
+
   const [completed, setCompleted] = useState([])
+
+  const bw = isBodyweight(equipment)
 
   const initialWeight = rec?.weight || lastSets[0]?.weight || 0
   const initialReps = rec?.reps || lastSets[0]?.reps || 10
-  const [weight, setWeight] = useState(initialWeight)
+  const [weight, setWeight] = useState(bw ? 0 : initialWeight)
   const [reps, setReps] = useState(initialReps)
+  const [repsLeft, setRepsLeft] = useState(initialReps)
 
   // Rest timer
   const [restEndTime, setRestEndTime] = useState(null)
@@ -2385,13 +2620,18 @@ function LogEntryScreen({
   function recordSet() {
     const w = Number(weight) || 0
     const r = Number(reps) || 0
-    if (r <= 0) return
-    const next = [...completed, { weight: w, reps: r }]
+    const rL = Number(repsLeft) || 0
+    if (r <= 0 && rL <= 0) return
+    const newSet = { weight: w, reps: r }
+    if (unilateral) newSet.repsLeft = rL
+    const next = [...completed, newSet]
     setCompleted(next)
     const nextPrev = lastSets[next.length]
     if (nextPrev) {
       setWeight(Number(nextPrev.weight) || w)
       setReps(Number(nextPrev.reps) || r)
+      if (unilateral)
+        setRepsLeft(Number(nextPrev.repsLeft) || Number(nextPrev.reps) || rL)
     }
     startTimer(restDuration)
   }
@@ -2401,10 +2641,15 @@ function LogEntryScreen({
   }
 
   function finish() {
-    onFinish(completed)
+    onFinish(completed, equipment)
   }
 
-  const plates = platesPerSide(Number(weight))
+  function removeCompletedSet(idx) {
+    setCompleted((prev) => prev.filter((_, i) => i !== idx))
+  }
+
+  const plates = isBarbell(equipment) ? platesPerSide(Number(weight)) : null
+  const weightLabel = bw ? 'Added (lb)' : 'Weight (lb)'
 
   return (
     <Shell>
@@ -2414,7 +2659,28 @@ function LogEntryScreen({
         {exercise}
       </h1>
 
-      {rec && (
+      {/* Equipment picker */}
+      <div className="mt-3 flex flex-wrap gap-1.5">
+        {EQUIPMENT_TYPES.map((e) => (
+          <button
+            key={e}
+            onClick={() => {
+              setEquipment(e)
+              // When switching to BW, default the weight to 0 (added load)
+              if (e === 'bodyweight' && Number(weight) === 0) setWeight(0)
+            }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium ${
+              equipment === e
+                ? 'bg-emerald-600 text-zinc-950'
+                : 'bg-zinc-900/60 text-zinc-400 active:bg-zinc-800/60'
+            }`}
+          >
+            {EQUIPMENT_LABEL[e]}
+          </button>
+        ))}
+      </div>
+
+      {rec && !bw && (
         <div
           className={`mt-3 rounded-xl px-3 py-2 text-xs font-medium ${
             rec.type === 'increase'
@@ -2438,33 +2704,66 @@ function LogEntryScreen({
         />
       )}
 
-      {/* Set number */}
+      {/* Set number + L/R toggle */}
       <div className="mt-4 flex items-center justify-between">
         <div className="text-2xl font-bold tracking-tight">
           Set {setIndex}
         </div>
-        {lastSets[setIndex - 1] && (
-          <div className="text-xs text-zinc-500 font-mono tabular-nums">
-            Last: {lastSets[setIndex - 1].reps}×{lastSets[setIndex - 1].weight}
-          </div>
-        )}
+        <div className="flex items-center gap-3">
+          {lastSets[setIndex - 1] && (
+            <div className="text-xs text-zinc-500 font-mono tabular-nums">
+              Last:{' '}
+              {lastSets[setIndex - 1].repsLeft !== undefined
+                ? `${lastSets[setIndex - 1].reps}R/${lastSets[setIndex - 1].repsLeft}L`
+                : `${lastSets[setIndex - 1].reps}`}
+              ×{lastSets[setIndex - 1].weight}
+            </div>
+          )}
+          <button
+            onClick={() => setUnilateral((v) => !v)}
+            className={`px-2 py-1 rounded-md text-[11px] font-semibold ${
+              unilateral
+                ? 'bg-emerald-600 text-zinc-950'
+                : 'bg-zinc-900/60 text-zinc-400'
+            }`}
+          >
+            L/R
+          </button>
+        </div>
       </div>
 
-      {/* Big inputs */}
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        <BigField label="Weight (lb)" value={weight} onChange={setWeight} />
-        <BigField label="Reps" value={reps} onChange={setReps} />
-      </div>
+      {/* Inputs */}
+      {unilateral ? (
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <BigField label={weightLabel} value={weight} onChange={setWeight} />
+          <BigField label="Right" value={reps} onChange={setReps} />
+          <BigField label="Left" value={repsLeft} onChange={setRepsLeft} />
+        </div>
+      ) : (
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <BigField label={weightLabel} value={weight} onChange={setWeight} />
+          <BigField label="Reps" value={reps} onChange={setReps} />
+        </div>
+      )}
 
-      {/* Plate calculator */}
+      {/* Plate calculator (barbell only) */}
       <div className="mt-2 min-h-[18px] text-center">
         {plates && plates.length > 0 ? (
           <div className="text-xs text-zinc-500 font-mono tabular-nums">
             Per side: {plates.join(' · ')}
           </div>
-        ) : Number(weight) >= BAR_WEIGHT ? (
+        ) : isBarbell(equipment) && Number(weight) >= BAR_WEIGHT ? (
           <div className="text-xs text-zinc-600 font-mono tabular-nums">
             45 lb bar only
+          </div>
+        ) : bw && Number(bodyWeight) > 0 ? (
+          <div className="text-xs text-zinc-600">
+            Body weight {bodyWeight} lb + added{' '}
+            {Number(weight) > 0 ? `${weight} lb` : '0'}
+          </div>
+        ) : bw ? (
+          <div className="text-xs text-zinc-600">
+            Set body weight in Settings for accurate volume
           </div>
         ) : null}
       </div>
@@ -2482,18 +2781,25 @@ function LogEntryScreen({
         ))}
       </div>
 
-      {/* Completed chips */}
+      {/* Completed chips — tap to remove */}
       <div className="mt-3 min-h-[28px] flex flex-wrap gap-1">
         {completed.map((s, i) => (
-          <span
+          <button
             key={i}
-            className="text-xs px-2 py-1 rounded-md bg-emerald-950/40 text-emerald-400 flex items-center gap-1 ring-1 ring-emerald-900/40"
+            onClick={() => removeCompletedSet(i)}
+            className="text-xs px-2 py-1 rounded-md bg-emerald-950/40 text-emerald-400 flex items-center gap-1 ring-1 ring-emerald-900/40 active:bg-emerald-900/40"
+            aria-label={`Remove set ${i + 1}`}
           >
             <Check size={10} />
             <span className="font-mono tabular-nums">
-              Set {i + 1} · {s.reps}×{s.weight}
+              Set {i + 1} ·{' '}
+              {s.repsLeft !== undefined
+                ? `${s.reps}R/${s.repsLeft}L`
+                : s.reps}
+              ×{s.weight}
             </span>
-          </span>
+            <X size={10} className="ml-0.5 opacity-60" />
+          </button>
         ))}
       </div>
 
@@ -3033,6 +3339,7 @@ function SessionDetailScreen({
   onBack,
   onCommitNotes,
   onOpenExercise,
+  onDelete,
 }) {
   const sessionWorkouts = session.workouts
     .map((id) => workouts.find((w) => w.id === id))
@@ -3130,7 +3437,8 @@ function SessionDetailScreen({
                 <ChevronRight size={14} className="text-zinc-500" />
               </div>
               <div className="text-[10px] tracking-[0.2em] text-zinc-500 mt-0.5">
-                {formatTimeOfDay(w.date)} · {w.muscleGroup.toUpperCase()}
+                {formatTimeOfDay(w.date)} · {w.muscleGroup.toUpperCase()} ·{' '}
+                {(EQUIPMENT_LABEL[exerciseEquip(w.exercise, w.equipment)] || 'OTHER').toUpperCase()}
               </div>
               <div className="mt-1 flex flex-wrap gap-1">
                 {w.sets.map((s, i) => (
@@ -3138,7 +3446,7 @@ function SessionDetailScreen({
                     key={i}
                     className="text-[11px] px-1.5 py-0.5 border border-zinc-800 text-zinc-300"
                   >
-                    {s.reps}×{s.weight}
+                    {formatSet(s, exerciseEquip(w.exercise, w.equipment))}
                   </span>
                 ))}
               </div>
@@ -3146,6 +3454,22 @@ function SessionDetailScreen({
           ))}
         </div>
       </div>
+
+      {/* Delete session */}
+      {onDelete && (
+        <button
+          onClick={() => {
+            const ok = confirm(
+              `Delete this session? ${sessionWorkouts.length} workout${sessionWorkouts.length === 1 ? '' : 's'} logged during it will also be removed. This can't be undone.`,
+            )
+            if (ok) onDelete()
+          }}
+          className="mt-6 w-full py-3 rounded-xl text-sm text-red-400 ring-1 ring-red-900/50 bg-red-950/20 active:bg-red-950/40 font-medium flex items-center justify-center gap-2"
+        >
+          <Trash2 size={14} />
+          Delete this session
+        </button>
+      )}
     </Shell>
   )
 }
@@ -3217,10 +3541,11 @@ function AllLiftsScreen({ workouts, onBack, onDelete, onOpenExercise, onEdit }) 
                   </button>
                   <button
                     onClick={() => onEdit(w.id)}
-                    className="px-2 py-3 text-zinc-500 active:text-zinc-100"
+                    className="px-2.5 py-1.5 mr-1 text-xs font-medium text-zinc-300 bg-zinc-800/60 rounded-md active:bg-zinc-700/60 flex items-center gap-1"
                     aria-label="Edit"
                   >
-                    <Pencil size={14} />
+                    <Pencil size={12} />
+                    Edit
                   </button>
                   <button
                     onClick={() => {
@@ -3250,7 +3575,7 @@ function AllLiftsScreen({ workouts, onBack, onDelete, onOpenExercise, onEdit }) 
 // EXERCISE DETAIL
 // ============================================================
 
-function ExerciseDetailScreen({ exercise, workouts, onBack }) {
+function ExerciseDetailScreen({ exercise, workouts, bodyWeight = 0, onBack }) {
   const matches = workouts.filter((w) => w.exercise === exercise)
   const sorted = [...matches].sort((a, b) => b.date - a.date)
   const muscleGroup = sorted[0]?.muscleGroup || ''
@@ -3268,6 +3593,16 @@ function ExerciseDetailScreen({ exercise, workouts, onBack }) {
       }
     }
   }
+
+  // Series for the 1RM chart (chronological, best 1RM per workout)
+  const oneRMSeries = [...matches]
+    .sort((a, b) => a.date - b.date)
+    .map((w) => ({ date: w.date, oneRM: workoutBest1RM(w, bodyWeight) }))
+    .filter((p) => p.oneRM > 0)
+  const latestOneRM =
+    oneRMSeries.length > 0
+      ? Math.round(oneRMSeries[oneRMSeries.length - 1].oneRM)
+      : null
 
   const rec = getRecommendation(exercise, muscleGroup, workouts)
 
@@ -3306,6 +3641,15 @@ function ExerciseDetailScreen({ exercise, workouts, onBack }) {
         </div>
       )}
 
+      {oneRMSeries.length >= 2 && (
+        <div className="mt-4">
+          <ExerciseProgressChart
+            series={oneRMSeries}
+            latest={latestOneRM}
+          />
+        </div>
+      )}
+
       <div className="mt-5">
         <Label>TIMELINE</Label>
         <div className="mt-2 border border-zinc-800 divide-y divide-zinc-800">
@@ -3333,7 +3677,7 @@ function ExerciseDetailScreen({ exercise, workouts, onBack }) {
                     key={i}
                     className="text-[11px] px-1.5 py-0.5 border border-zinc-800 text-zinc-300"
                   >
-                    {s.reps}×{s.weight}
+                    {formatSet(s, exerciseEquip(w.exercise, w.equipment))}
                   </span>
                 ))}
               </div>
@@ -3368,11 +3712,84 @@ function SleekBackBar({ onBack, title, right }) {
   )
 }
 
-function SettingsScreen({ workouts, sessions, onBack, onImport, onReset }) {
+function SettingsScreen({
+  workouts,
+  sessions,
+  bodyWeight,
+  onChangeBodyWeight,
+  onBack,
+  onImport,
+  onReset,
+}) {
   const [importText, setImportText] = useState('')
   const [importStatus, setImportStatus] = useState(null)
   const [pasteOpen, setPasteOpen] = useState(false)
+  const [csvRange, setCsvRange] = useState(30) // days; 0 = all
+  const [bwInput, setBwInput] = useState(String(bodyWeight || ''))
   const fileInputRef = useRef(null)
+
+  useEffect(() => {
+    setBwInput(String(bodyWeight || ''))
+  }, [bodyWeight])
+
+  function commitBodyWeight() {
+    const n = Number(bwInput) || 0
+    if (n !== bodyWeight) onChangeBodyWeight(n)
+  }
+
+  function csvEscape(s) {
+    const str = String(s ?? '')
+    if (/[,"\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`
+    return str
+  }
+
+  function buildAndDownloadCSV() {
+    const cutoff =
+      csvRange > 0 ? Date.now() - csvRange * 86400000 : 0
+    const filtered = workouts
+      .filter((w) => w.date >= cutoff)
+      .sort((a, b) => a.date - b.date)
+    const header = [
+      'date',
+      'exercise',
+      'muscle_group',
+      'equipment',
+      'set_index',
+      'weight',
+      'reps',
+      'reps_left',
+    ]
+    const lines = [header.join(',')]
+    for (const w of filtered) {
+      const equip = exerciseEquip(w.exercise, w.equipment)
+      const dateStr = new Date(w.date).toISOString()
+      ;(w.sets || []).forEach((s, i) => {
+        lines.push(
+          [
+            dateStr,
+            csvEscape(w.exercise),
+            csvEscape(w.muscleGroup),
+            equip,
+            i + 1,
+            s.weight ?? 0,
+            s.reps ?? 0,
+            s.repsLeft ?? '',
+          ].join(','),
+        )
+      })
+    }
+    const csv = lines.join('\n')
+    const blob = new Blob([csv], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const rangeLabel = csvRange === 0 ? 'all' : `${csvRange}d`
+    a.href = url
+    a.download = `liftlog-${rangeLabel}-${new Date().toISOString().slice(0, 10)}.csv`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
 
   function handleExport() {
     const data = {
@@ -3471,7 +3888,28 @@ function SettingsScreen({ workouts, sessions, onBack, onImport, onReset }) {
         Back up or restore your history.
       </p>
 
+      {/* Body weight */}
       <div className="mt-6 bg-zinc-900/60 rounded-2xl p-4">
+        <div className="text-xs text-zinc-500 font-medium">Body weight</div>
+        <div className="mt-2 flex items-center gap-3">
+          <input
+            type="number"
+            inputMode="decimal"
+            value={bwInput}
+            onChange={(e) => setBwInput(e.target.value)}
+            onBlur={commitBodyWeight}
+            placeholder="0"
+            className="flex-1 bg-zinc-950/60 rounded-lg px-3 py-3 text-center font-mono tabular-nums text-2xl font-semibold ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+          />
+          <span className="text-sm text-zinc-500">lb</span>
+        </div>
+        <p className="mt-2 text-xs text-zinc-500 leading-relaxed">
+          Used to estimate volume for bodyweight exercises (push-ups, planks,
+          pull-ups). Update if your weight changes.
+        </p>
+      </div>
+
+      <div className="mt-4 bg-zinc-900/60 rounded-2xl p-4">
         <div className="text-xs text-zinc-500 font-medium">Current data</div>
         <div className="mt-3 grid grid-cols-2 gap-2">
           <div>
@@ -3551,6 +3989,43 @@ function SettingsScreen({ workouts, sessions, onBack, onImport, onReset }) {
           {importStatus.message}
         </div>
       )}
+
+      {/* CSV export */}
+      <div className="mt-8 text-xs text-zinc-500 font-medium">
+        Export to CSV
+      </div>
+      <div className="mt-2 bg-zinc-900/40 rounded-2xl p-3">
+        <div className="grid grid-cols-4 gap-2">
+          {[
+            { d: 7, l: '7d' },
+            { d: 30, l: '30d' },
+            { d: 90, l: '90d' },
+            { d: 0, l: 'All' },
+          ].map((opt) => (
+            <button
+              key={opt.l}
+              onClick={() => setCsvRange(opt.d)}
+              className={`py-2 rounded-lg text-xs font-medium tabular-nums ${
+                csvRange === opt.d
+                  ? 'bg-emerald-600 text-zinc-950'
+                  : 'bg-zinc-900/60 text-zinc-400 active:bg-zinc-800/60'
+              }`}
+            >
+              {opt.l}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={buildAndDownloadCSV}
+          className="mt-2 w-full py-3 rounded-xl bg-zinc-100/95 text-zinc-950 font-semibold flex items-center justify-center gap-2 active:bg-zinc-200"
+        >
+          <Download size={16} />
+          Download CSV
+        </button>
+        <p className="mt-2 text-xs text-zinc-500">
+          One row per set. Opens cleanly in Excel and Google Sheets.
+        </p>
+      </div>
 
       <div className="mt-8 text-xs text-zinc-500 font-medium">
         Danger zone
@@ -3705,6 +4180,371 @@ function EditWorkoutScreen({ workout, onCancel, onSave, onDelete }) {
           className="py-3 rounded-xl text-sm bg-emerald-600 text-zinc-950 font-semibold active:bg-emerald-500"
         >
           Save changes
+        </button>
+      </div>
+    </Shell>
+  )
+}
+
+// ============================================================
+// EXERCISE PROGRESS CHART (1RM line)
+// ============================================================
+
+function ExerciseProgressChart({ series, latest }) {
+  if (!series || series.length < 2) return null
+
+  const width = 320
+  const height = 130
+  const padX = 14
+  const padTop = 14
+  const padBottom = 22
+  const innerW = width - padX * 2
+  const innerH = height - padTop - padBottom
+
+  const ys = series.map((p) => p.oneRM)
+  const yMin = Math.min(...ys) * 0.9
+  const yMax = Math.max(...ys) * 1.05
+  const yRange = Math.max(1, yMax - yMin)
+  const dateRange = series[series.length - 1].date - series[0].date
+  const startDate = series[0].date
+
+  const points = series.map((p, i) => {
+    const xT =
+      dateRange > 0
+        ? (p.date - startDate) / dateRange
+        : i / Math.max(1, series.length - 1)
+    return {
+      x: padX + xT * innerW,
+      y: padTop + (1 - (p.oneRM - yMin) / yRange) * innerH,
+      oneRM: p.oneRM,
+      date: p.date,
+    }
+  })
+
+  return (
+    <div className="bg-zinc-900/60 rounded-2xl p-4">
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <div className="text-sm font-semibold">Progress</div>
+          <div className="text-xs text-zinc-500">
+            Estimated 1RM over time
+          </div>
+        </div>
+        {latest !== null && (
+          <div className="text-right">
+            <div className="text-[10px] text-zinc-500 font-medium">
+              Latest
+            </div>
+            <div className="font-mono tabular-nums text-lg font-semibold text-emerald-400">
+              {latest} lb
+            </div>
+          </div>
+        )}
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full block">
+        {/* Reference gridlines (3 horizontal) */}
+        {[0, 0.5, 1].map((f, i) => (
+          <line
+            key={i}
+            x1={padX}
+            x2={width - padX}
+            y1={padTop + (1 - f) * innerH}
+            y2={padTop + (1 - f) * innerH}
+            stroke="rgb(39 39 42 / 0.6)"
+            strokeWidth="0.5"
+            strokeDasharray="2 3"
+          />
+        ))}
+        <polyline
+          points={points.map((p) => `${p.x},${p.y}`).join(' ')}
+          fill="none"
+          stroke="rgb(16 185 129)"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        {points.map((p, i) => (
+          <circle
+            key={i}
+            cx={p.x}
+            cy={p.y}
+            r="2.5"
+            fill="rgb(16 185 129)"
+          />
+        ))}
+        <text
+          x={padX}
+          y={height - 5}
+          fontSize="9"
+          fill="rgb(113 113 122)"
+          fontFamily="JetBrains Mono, monospace"
+        >
+          {new Date(points[0].date).toLocaleDateString('en-US', {
+            month: 'numeric',
+            day: 'numeric',
+          })}
+        </text>
+        <text
+          x={width - padX}
+          y={height - 5}
+          textAnchor="end"
+          fontSize="9"
+          fill="rgb(113 113 122)"
+          fontFamily="JetBrains Mono, monospace"
+        >
+          {new Date(points[points.length - 1].date).toLocaleDateString(
+            'en-US',
+            {
+              month: 'numeric',
+              day: 'numeric',
+            },
+          )}
+        </text>
+      </svg>
+    </div>
+  )
+}
+
+// ============================================================
+// PLAN EDITOR
+// ============================================================
+
+function PlanEditorScreen({ plan, isDraft, onBack, onSave, onReset }) {
+  const [exercises, setExercises] = useState(() =>
+    plan.exercises.map((e) => ({ ...e })),
+  )
+  const [adding, setAdding] = useState(false)
+  const [addGroup, setAddGroup] = useState(plan.focus?.[0] || 'Chest')
+  const [addExercise, setAddExercise] = useState(EXERCISES['Chest']?.[0] || '')
+  const [addSets, setAddSets] = useState('3')
+  const [addReps, setAddReps] = useState('10')
+
+  function updateRow(i, field, value) {
+    setExercises((prev) =>
+      prev.map((e, idx) =>
+        idx === i ? { ...e, [field]: Number(value) || 0 } : e,
+      ),
+    )
+  }
+
+  function removeRow(i) {
+    setExercises((prev) => prev.filter((_, idx) => idx !== i))
+  }
+
+  function addRow() {
+    const name = addExercise.trim()
+    if (!name) return
+    setExercises((prev) => [
+      ...prev,
+      {
+        exercise: name,
+        muscleGroup: addGroup,
+        sets: Math.max(1, Number(addSets) || 3),
+        reps: Math.max(1, Number(addReps) || 10),
+        weight: 0,
+        isAnchor: false,
+      },
+    ])
+    setAdding(false)
+  }
+
+  function save() {
+    const edited = {
+      ...plan,
+      exercises,
+      estimatedMinutes: exercises.reduce(
+        (sum, e) => sum + (e.isAnchor ? 8 : 5),
+        0,
+      ),
+    }
+    onSave(edited)
+  }
+
+  // When the muscle group changes in the add form, reset exercise to first
+  useEffect(() => {
+    const list = EXERCISES[addGroup] || []
+    if (list.length > 0) setAddExercise(list[0])
+  }, [addGroup])
+
+  return (
+    <Shell>
+      <SleekBackBar onBack={onBack} title="Plan" />
+
+      <h1 className="text-4xl font-extrabold tracking-tight leading-none">
+        Edit plan
+      </h1>
+      <p className="mt-1 text-sm text-zinc-500">
+        {titleCase(plan.dayType)} day · {plan.focus.join(' + ')}
+      </p>
+
+      <div className="mt-5 text-xs text-zinc-500 font-medium">Exercises</div>
+      <div className="mt-2 space-y-2">
+        {exercises.map((e, i) => (
+          <div
+            key={i}
+            className="bg-zinc-900/60 rounded-xl px-3 py-3"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold">
+                  {e.exercise}
+                  {e.isAnchor && (
+                    <span className="ml-2 text-[10px] text-emerald-500 font-medium">
+                      COMPOUND
+                    </span>
+                  )}
+                </div>
+                <div className="text-xs text-zinc-500 mt-0.5">
+                  {e.muscleGroup}
+                </div>
+              </div>
+              <button
+                onClick={() => removeRow(i)}
+                className="p-1.5 text-zinc-500 active:text-red-400"
+                aria-label="Remove"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <label className="block">
+                <div className="text-[10px] text-zinc-500 font-medium">
+                  Sets
+                </div>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  value={e.sets}
+                  onChange={(ev) => updateRow(i, 'sets', ev.target.value)}
+                  className="mt-0.5 w-full bg-zinc-950/60 rounded-lg px-2 py-2 text-center font-mono tabular-nums text-base ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+                />
+              </label>
+              <label className="block">
+                <div className="text-[10px] text-zinc-500 font-medium">
+                  Reps
+                </div>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  value={e.reps}
+                  onChange={(ev) => updateRow(i, 'reps', ev.target.value)}
+                  className="mt-0.5 w-full bg-zinc-950/60 rounded-lg px-2 py-2 text-center font-mono tabular-nums text-base ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+                />
+              </label>
+            </div>
+          </div>
+        ))}
+        {exercises.length === 0 && (
+          <div className="bg-zinc-900/40 rounded-xl px-3 py-4 text-sm text-zinc-500 text-center">
+            No exercises — add some below.
+          </div>
+        )}
+      </div>
+
+      {!adding && (
+        <button
+          onClick={() => setAdding(true)}
+          className="mt-3 w-full py-3 rounded-xl border border-dashed border-zinc-700 text-zinc-300 flex items-center justify-center gap-2 active:bg-zinc-900/40"
+        >
+          <Plus size={16} />
+          <span className="text-sm">Add exercise</span>
+        </button>
+      )}
+
+      {adding && (
+        <div className="mt-3 bg-zinc-900/40 rounded-2xl p-3">
+          <div className="text-xs text-zinc-500 font-medium">Add exercise</div>
+          <div className="mt-2 space-y-2">
+            <label className="block">
+              <div className="text-[10px] text-zinc-500 font-medium">
+                Muscle group
+              </div>
+              <select
+                value={addGroup}
+                onChange={(e) => setAddGroup(e.target.value)}
+                className="mt-0.5 w-full bg-zinc-950/60 rounded-lg px-2 py-2 text-sm ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+              >
+                {MUSCLE_GROUPS.map((g) => (
+                  <option key={g} value={g}>
+                    {g}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <div className="text-[10px] text-zinc-500 font-medium">
+                Exercise
+              </div>
+              <select
+                value={addExercise}
+                onChange={(e) => setAddExercise(e.target.value)}
+                className="mt-0.5 w-full bg-zinc-950/60 rounded-lg px-2 py-2 text-sm ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+              >
+                {(EXERCISES[addGroup] || []).map((ex) => (
+                  <option key={ex} value={ex}>
+                    {ex}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <label className="block">
+                <div className="text-[10px] text-zinc-500 font-medium">
+                  Sets
+                </div>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  value={addSets}
+                  onChange={(e) => setAddSets(e.target.value)}
+                  className="mt-0.5 w-full bg-zinc-950/60 rounded-lg px-2 py-2 text-center font-mono tabular-nums text-base ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+                />
+              </label>
+              <label className="block">
+                <div className="text-[10px] text-zinc-500 font-medium">
+                  Reps
+                </div>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  value={addReps}
+                  onChange={(e) => setAddReps(e.target.value)}
+                  className="mt-0.5 w-full bg-zinc-950/60 rounded-lg px-2 py-2 text-center font-mono tabular-nums text-base ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+                />
+              </label>
+            </div>
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button
+                onClick={() => setAdding(false)}
+                className="py-2.5 rounded-lg bg-zinc-900/60 text-xs font-medium active:bg-zinc-800/60"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={addRow}
+                className="py-2.5 rounded-lg bg-emerald-600 text-zinc-950 text-xs font-semibold active:bg-emerald-500"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-6 grid grid-cols-2 gap-2">
+        {isDraft && (
+          <button
+            onClick={onReset}
+            className="py-3 rounded-xl text-sm font-medium text-zinc-400 ring-1 ring-zinc-800 bg-zinc-900/40 active:bg-zinc-900/80"
+          >
+            Reset to suggested
+          </button>
+        )}
+        <button
+          onClick={save}
+          className={`py-3 rounded-xl text-sm bg-emerald-600 text-zinc-950 font-semibold active:bg-emerald-500 ${isDraft ? '' : 'col-span-2'}`}
+        >
+          Save plan
         </button>
       </div>
     </Shell>
