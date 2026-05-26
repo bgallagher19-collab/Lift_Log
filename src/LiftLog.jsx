@@ -45,6 +45,9 @@ const STORAGE = {
   bodyWeight: 'liftlog:bodyWeight',
   planDraft: 'liftlog:planDraft',
   favorites: 'liftlog:favorites',
+  thumbs: 'liftlog:thumbs',
+  units: 'liftlog:units',
+  apiKey: 'liftlog:apiKey',
 }
 
 const MUSCLE_GROUPS = ['Chest', 'Back', 'Shoulders', 'Arms', 'Legs', 'Core']
@@ -179,19 +182,51 @@ const EXERCISE_META = {
   'Leg Extension': { equip: 'machine' },
   'Calf Raise': { equip: 'machine' },
   // Core
-  Plank: { equip: 'bodyweight' },
+  Plank: { equip: 'bodyweight', unit: 'seconds' },
   'Hanging Leg Raise': { equip: 'bodyweight' },
   'Russian Twist': { equip: 'bodyweight' },
   'Ab Wheel Rollout': { equip: 'bodyweight' },
   'Cable Crunch': { equip: 'cable' },
   'Sit-Up': { equip: 'bodyweight' },
-  'Mountain Climber': { equip: 'bodyweight' },
-  'Hollow Hold': { equip: 'bodyweight' },
+  'Mountain Climber': { equip: 'bodyweight', unit: 'seconds' },
+  'Hollow Hold': { equip: 'bodyweight', unit: 'seconds' },
 }
+
+// Muscle-group accent colors used in thumbnails and chips.
+const MUSCLE_COLORS = {
+  Chest: { bg: 'bg-rose-950/50', ring: 'ring-rose-900/40', text: 'text-rose-300' },
+  Back: { bg: 'bg-sky-950/50', ring: 'ring-sky-900/40', text: 'text-sky-300' },
+  Shoulders: {
+    bg: 'bg-amber-950/50',
+    ring: 'ring-amber-900/40',
+    text: 'text-amber-300',
+  },
+  Arms: {
+    bg: 'bg-violet-950/50',
+    ring: 'ring-violet-900/40',
+    text: 'text-violet-300',
+  },
+  Legs: {
+    bg: 'bg-emerald-950/50',
+    ring: 'ring-emerald-900/40',
+    text: 'text-emerald-300',
+  },
+  Core: { bg: 'bg-zinc-900', ring: 'ring-zinc-700/50', text: 'text-zinc-300' },
+}
+
+const MUSCLE_FALLBACK_COLOR = MUSCLE_COLORS.Core
 
 function exerciseEquip(name, override) {
   if (override) return override
   return EXERCISE_META[name]?.equip || 'unspecified'
+}
+
+// Per-exercise unit: 'reps' (default) or 'seconds'. User-set overrides live in
+// the `units` map (keyed by exercise name) and beat the built-in defaults.
+function exerciseUnit(name, unitsMap) {
+  const override = unitsMap?.[name]
+  if (override === 'reps' || override === 'seconds') return override
+  return EXERCISE_META[name]?.unit || 'reps'
 }
 
 const isBodyweight = (equip) => equip === 'bodyweight'
@@ -210,6 +245,18 @@ const SCORE_TIERS = [
 ]
 
 const LIFT_GOAL = 10
+
+// Descriptions surfaced when the user taps a row in the score breakdown.
+const SCORE_DESCRIPTIONS = {
+  volume:
+    'Total weight × work units across every set. Compared to your recent 4-session average — being above your average pushes this toward full credit.',
+  overload:
+    "Of the muscle groups you trained with prior history, how many got beaten today (best estimated 1RM). Swapping exercises within a group doesn't hurt — beating any prior best in that group counts.",
+  activity:
+    'How many lifts you logged. Sigmoid centered at 5 lifts — 3 lifts ≈ 3 pts, 5 lifts = 10 pts, the goal of 10 lifts pegs the meter.',
+  repRange:
+    'Share of working sets in the 10–12 hypertrophy zone. Weighted by sample size so a single perfect set doesn\'t earn full credit — full weight kicks in at 6+ sets.',
+}
 
 // PPL planner constants
 // PUSH = Chest + Arms (triceps emphasis)
@@ -284,6 +331,16 @@ const isLowerBody = (exercise, muscleGroup) =>
 // Total reps for a set, summing both sides if unilateral
 const setReps = (s) => (Number(s.reps) || 0) + (Number(s.repsLeft) || 0)
 
+// "Work units" for a set. For rep-based sets it's just reps. For time-based sets
+// (planks etc.) we treat 5 seconds as roughly 1 rep so volume is comparable.
+const SECONDS_PER_REP_EQUIV = 5
+function setWorkUnits(s) {
+  if (s.duration && (!s.reps || Number(s.reps) === 0)) {
+    return (Number(s.duration) || 0) / SECONDS_PER_REP_EQUIV
+  }
+  return setReps(s)
+}
+
 // Effective per-rep weight. For Bodyweight exercises, multiply by (bodyWeight
 // + addedLoad) so push-ups and pull-ups actually contribute volume.
 function setEffectiveWeight(s, equip, bodyWeight) {
@@ -298,7 +355,7 @@ function setEffectiveWeight(s, equip, bodyWeight) {
 function workoutVolume(w, bodyWeight = 0) {
   const equip = exerciseEquip(w.exercise, w.equipment)
   return (w.sets || []).reduce(
-    (sum, s) => sum + setEffectiveWeight(s, equip, bodyWeight) * setReps(s),
+    (sum, s) => sum + setEffectiveWeight(s, equip, bodyWeight) * setWorkUnits(s),
     0,
   )
 }
@@ -307,7 +364,7 @@ function bestSetWeight(w, bodyWeight = 0) {
   const equip = exerciseEquip(w.exercise, w.equipment)
   return (w.sets || []).reduce(
     (best, s) =>
-      Math.max(best, setEffectiveWeight(s, equip, bodyWeight) * setReps(s)),
+      Math.max(best, setEffectiveWeight(s, equip, bodyWeight) * setWorkUnits(s)),
     0,
   )
 }
@@ -327,15 +384,24 @@ function workoutBest1RM(w, bodyWeight = 0) {
   let best = 0
   for (const s of w.sets || []) {
     const ew = setEffectiveWeight(s, equip, bodyWeight)
-    const r = setReps(s)
+    const r = setWorkUnits(s)
     const e = epley1RM(ew, r)
     if (e > best) best = e
   }
   return best
 }
 
-// Human-readable summary of one set, e.g. "10×135", "8R/7L×50", "12 · BW"
+// Human-readable summary of one set:
+//   reps mode  → "10×135", "8R/7L×50", "12 · BW"
+//   time mode  → "45s · BW", "30s×25"
 function formatSet(set, equip) {
+  if (set.duration && (!set.reps || Number(set.reps) === 0)) {
+    const d = `${Number(set.duration) || 0}s`
+    if (isBodyweight(equip) && (!set.weight || Number(set.weight) === 0)) {
+      return `${d} · BW`
+    }
+    return `${d}×${set.weight}`
+  }
   const repsPart =
     set.repsLeft !== undefined && set.repsLeft !== null
       ? `${set.reps}R/${set.repsLeft}L`
@@ -405,11 +471,39 @@ function lastOccurrence(exercise, workouts, before = Infinity) {
   return latest
 }
 
-// Get recommendation for next time doing an exercise
-function getRecommendation(exercise, muscleGroup, workouts) {
+// Last N workouts for an exercise, most recent first
+function recentWorkoutsFor(exercise, workouts, n = 3) {
+  return workouts
+    .filter((w) => w.exercise === exercise)
+    .sort((a, b) => b.date - a.date)
+    .slice(0, n)
+}
+
+// Last date a muscle group (any exercise) was trained
+function lastGroupTrainingDate(muscleGroup, workouts) {
+  let latest = 0
+  for (const w of workouts) {
+    if (w.muscleGroup !== muscleGroup) continue
+    if (w.date > latest) latest = w.date
+  }
+  return latest || null
+}
+
+const round5 = (n) => Math.max(0, Math.round(n / 5) * 5)
+
+// Get recommendation for next time doing an exercise.
+// Considers: last result, trend across recent workouts, days since the muscle
+// group was trained, and (optionally) today's readiness (0..1 from feel).
+function getRecommendation(exercise, muscleGroup, workouts, opts = {}) {
+  const { readiness = null } = opts
   const last = lastOccurrence(exercise, workouts)
   if (!last)
-    return { type: 'first', text: 'FIRST TIME — START LIGHT', weight: 0, reps: 10 }
+    return {
+      type: 'first',
+      text: 'FIRST TIME — START LIGHT',
+      weight: 0,
+      reps: 10,
+    }
 
   const sets = last.sets || []
   if (sets.length === 0) return null
@@ -426,8 +520,32 @@ function getRecommendation(exercise, muscleGroup, workouts) {
   const lower = isLowerBody(exercise, groupFromLast)
   const bump = lower ? 10 : 5
 
+  // Trend signal: have we already increased the top weight across the last 3
+  // sessions? Used to throttle further jumps so we don't compound too fast.
+  const recent = recentWorkoutsFor(exercise, workouts, 3)
+  const tops = recent
+    .slice()
+    .reverse()
+    .map((w) => Math.max(0, ...w.sets.map((s) => Number(s.weight) || 0)))
+  const trendingUp =
+    tops.length >= 3 && tops[2] > tops[1] && tops[1] > tops[0]
+
+  // Group recency: if a muscle group is overdue (5+ days), we can push a bit
+  // harder; if trained yesterday, hold.
+  const lastGroupDate = lastGroupTrainingDate(groupFromLast, workouts)
+  const groupGap = daysSince(lastGroupDate)
+  const overdue = groupGap !== Infinity && groupGap >= 5
+  const freshHit = groupGap === 0
+
+  // Readiness multiplier on the bump: 1 = avg, scales 0.4 → 1.4
+  const readinessMult =
+    typeof readiness === 'number'
+      ? Math.max(0.4, Math.min(1.4, 0.4 + readiness * 1.2))
+      : 1
+
+  // Long lay-off → deload
   if (gap > 14) {
-    const w = Math.max(5, Math.round((lastWeight * 0.9) / 5) * 5)
+    const w = round5(lastWeight * 0.9)
     return {
       type: 'deload',
       text: `${gap}D OFF — DELOAD TO ${w}LB`,
@@ -435,22 +553,44 @@ function getRecommendation(exercise, muscleGroup, workouts) {
       reps: 10,
     }
   }
-  if (allHit12) {
+
+  // Low readiness day → repeat last weight, target middle of rep range
+  if (readiness !== null && readiness < 0.35 && lastWeight > 0) {
     return {
-      type: 'increase',
-      text: `+${bump}LB → ${lastWeight + bump} × 10`,
-      weight: lastWeight + bump,
+      type: 'hold',
+      text: `LOW READINESS — REPEAT ${lastWeight}LB × 10`,
+      weight: lastWeight,
       reps: 10,
     }
   }
-  if (minReps >= 10) {
+
+  // Hit 12 across the board → push the weight up, scaled by readiness/recency
+  if (allHit12) {
+    let adjusted = bump * readinessMult
+    if (overdue) adjusted *= 1.1
+    if (trendingUp) adjusted *= 0.7
+    if (freshHit) adjusted *= 0.7
+    const targetBump = Math.max(2.5, round5(adjusted) || 5)
+    const next = lastWeight + targetBump
     return {
-      type: 'push',
-      text: `STAY ${lastWeight}LB — PUSH PAST ${maxReps}`,
-      weight: lastWeight,
-      reps: maxReps + 1,
+      type: 'increase',
+      text: `+${targetBump}LB → ${next} × 10`,
+      weight: next,
+      reps: 10,
     }
   }
+
+  if (minReps >= 10) {
+    const repTarget =
+      readiness !== null && readiness >= 0.65 ? maxReps + 1 : maxReps
+    return {
+      type: 'push',
+      text: `STAY ${lastWeight}LB — PUSH PAST ${repTarget - 1}`,
+      weight: lastWeight,
+      reps: repTarget,
+    }
+  }
+
   return {
     type: 'repeat',
     text: `REPEAT ${lastWeight}LB × ${reps[0] || 10}`,
@@ -796,23 +936,27 @@ function calculateScore(session, allSessions, allWorkouts) {
         : 0
 
   // PROGRESSIVE OVERLOAD (25)
+  // Compare against best 1RM in the same muscle group, not just the same
+  // exercise — swapping dumbbell press for bench press shouldn't be penalized.
+  // Denominator is comparable (not session length) so first-time movements
+  // don't drag the ratio down.
   let beaten = 0
   let comparable = 0
   sessionWorkouts.forEach((w) => {
     const priorBest = allWorkouts
       .filter(
-        (x) => x.exercise === w.exercise && x.id !== w.id && x.date < w.date,
+        (x) =>
+          x.muscleGroup === w.muscleGroup &&
+          x.id !== w.id &&
+          x.date < w.date,
       )
-      .reduce((best, p) => Math.max(best, bestSetWeight(p)), 0)
+      .reduce((best, p) => Math.max(best, workoutBest1RM(p)), 0)
     if (priorBest > 0) {
       comparable++
-      if (bestSetWeight(w) > priorBest) beaten++
+      if (workoutBest1RM(w) >= priorBest) beaten++
     }
   })
-  // No comparable history means you didn't actually beat anything — score 0,
-  // not the half-credit consolation prize the old fallback handed out.
-  const overloadPts =
-    comparable > 0 ? (beaten / sessionWorkouts.length) * 25 : 0
+  const overloadPts = comparable > 0 ? (beaten / comparable) * 25 : 0
 
   // ACTIVITY COUNT (20) — sigmoid centered at 5 lifts:
   //   0 lifts = 0, 3 ≈ 3, 5 = 10, 7 ≈ 17, 10+ ≈ 20.
@@ -914,7 +1058,9 @@ function generateCoachWrapUp(session, allWorkouts, allSessions) {
     0,
   )
 
-  // PRs hit this session
+  // PRs hit this session — a PR is beating any prior best for that exact
+  // exercise (still want exact match here since beating "your bench" is a
+  // meaningful headline; cross-exercise wins live in the overload score).
   const prs = []
   for (const w of sessionWorkouts) {
     const priorBest = allWorkouts
@@ -1308,6 +1454,60 @@ function Label({ children, className = '' }) {
   )
 }
 
+// Visual thumbnail for an exercise — user photo if set, otherwise an
+// equipment-icon tile colored by muscle group. Pass `size` for fixed-square,
+// or `fill` to stretch into a parent (caller controls width/height).
+function ExerciseThumbnail({
+  exercise,
+  muscleGroup,
+  thumbs,
+  size = 64,
+  fill = false,
+  iconSize,
+  className = '',
+}) {
+  const photo = thumbs?.[exercise]
+  const color = MUSCLE_COLORS[muscleGroup] || MUSCLE_FALLBACK_COLOR
+  const equip = exerciseEquip(exercise)
+  const Icon =
+    equip === 'cable' || equip === 'machine'
+      ? Activity
+      : equip === 'bodyweight'
+        ? Heart
+        : Dumbbell
+
+  const dimStyle = fill ? undefined : { width: size, height: size }
+
+  if (photo) {
+    return (
+      <div
+        className={`overflow-hidden bg-zinc-900 ${fill ? '' : 'rounded-xl ring-1 ring-zinc-800'} ${className}`}
+        style={dimStyle}
+      >
+        <img
+          src={photo}
+          alt=""
+          className="w-full h-full object-cover"
+          loading="lazy"
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div
+      className={`flex items-center justify-center ${fill ? '' : 'rounded-xl ring-1'} ${color.bg} ${fill ? '' : color.ring} ${className}`}
+      style={dimStyle}
+    >
+      <Icon
+        size={iconSize || size * 0.42}
+        className={color.text}
+        strokeWidth={1.75}
+      />
+    </div>
+  )
+}
+
 // ============================================================
 // NOTES EDITOR (debounced)
 // ============================================================
@@ -1365,6 +1565,9 @@ export default function LiftLog() {
   const [bodyWeight, setBodyWeight] = useState(0)
   const [planDraft, setPlanDraft] = useState(null)
   const [favorites, setFavorites] = useState([])
+  const [thumbs, setThumbs] = useState({})
+  const [units, setUnits] = useState({})
+  const [apiKey, setApiKey] = useState('')
 
   // Load from localStorage on mount
   useEffect(() => {
@@ -1374,6 +1577,9 @@ export default function LiftLog() {
     setBodyWeight(Number(loadJSON(STORAGE.bodyWeight, 0)) || 0)
     setPlanDraft(loadJSON(STORAGE.planDraft, null))
     setFavorites(loadJSON(STORAGE.favorites, []))
+    setThumbs(loadJSON(STORAGE.thumbs, {}))
+    setUnits(loadJSON(STORAGE.units, {}))
+    setApiKey(loadJSON(STORAGE.apiKey, '') || '')
     setLoaded(true)
   }, [])
 
@@ -1404,6 +1610,65 @@ export default function LiftLog() {
     if (!loaded) return
     saveJSON(STORAGE.favorites, favorites)
   }, [favorites, loaded])
+  useEffect(() => {
+    if (!loaded) return
+    saveJSON(STORAGE.thumbs, thumbs)
+  }, [thumbs, loaded])
+  useEffect(() => {
+    if (!loaded) return
+    saveJSON(STORAGE.units, units)
+  }, [units, loaded])
+  useEffect(() => {
+    if (!loaded) return
+    if (apiKey) saveJSON(STORAGE.apiKey, apiKey)
+    else clearKey(STORAGE.apiKey)
+  }, [apiKey, loaded])
+
+  function setThumb(exercise, dataUrl) {
+    setThumbs((prev) => {
+      if (!dataUrl) {
+        const { [exercise]: _, ...rest } = prev
+        return rest
+      }
+      return { ...prev, [exercise]: dataUrl }
+    })
+  }
+
+  function setUnit(exercise, unit) {
+    setUnits((prev) => {
+      if (!unit || unit === EXERCISE_META[exercise]?.unit) {
+        const { [exercise]: _, ...rest } = prev
+        return rest
+      }
+      return { ...prev, [exercise]: unit }
+    })
+  }
+
+  function renameOrMergeExercise(oldName, newName) {
+    const target = (newName || '').trim()
+    if (!target || target === oldName) return
+    setWorkouts((prev) =>
+      prev.map((w) =>
+        w.exercise === oldName ? { ...w, exercise: target } : w,
+      ),
+    )
+    // Carry thumbnails / units / favorites along if the target is empty
+    setThumbs((prev) => {
+      if (!prev[oldName]) return prev
+      const { [oldName]: photo, ...rest } = prev
+      return { ...rest, [target]: rest[target] || photo }
+    })
+    setUnits((prev) => {
+      if (!prev[oldName]) return prev
+      const { [oldName]: u, ...rest } = prev
+      return { ...rest, [target]: rest[target] || u }
+    })
+    setFavorites((prev) => {
+      const set = new Set(prev.filter((e) => e !== oldName))
+      if (prev.includes(oldName)) set.add(target)
+      return Array.from(set)
+    })
+  }
 
   function toggleFavorite(exerciseName) {
     setFavorites((prev) =>
@@ -1457,13 +1722,22 @@ export default function LiftLog() {
 
   function logWorkout(exercise, muscleGroup, sets, equipment) {
     const filteredSets = sets
-      .filter((s) => Number(s.weight) >= 0 && (Number(s.reps) > 0 || Number(s.repsLeft) > 0))
+      .filter(
+        (s) =>
+          Number(s.weight) >= 0 &&
+          (Number(s.reps) > 0 ||
+            Number(s.repsLeft) > 0 ||
+            Number(s.duration) > 0),
+      )
       .map((s) => {
         const set = {
           weight: Number(s.weight) || 0,
           reps: Number(s.reps) || 0,
         }
         if (s.time) set.time = s.time
+        if (s.duration && Number(s.duration) > 0) {
+          set.duration = Number(s.duration)
+        }
         if (s.repsLeft !== undefined && s.repsLeft !== '' && s.repsLeft !== null) {
           set.repsLeft = Number(s.repsLeft) || 0
         }
@@ -1585,6 +1859,8 @@ export default function LiftLog() {
         sessions={sessions}
         plan={resolvedPlan}
         planIsDraft={!!planDraft}
+        thumbs={thumbs}
+        hasApiKey={!!apiKey}
         onStart={() => setView('checkin')}
         onResume={() => {
           setNow(Date.now())
@@ -1598,6 +1874,7 @@ export default function LiftLog() {
         }}
         onSettings={() => setView('settings')}
         onEditPlan={() => setView('plan-editor')}
+        onPlanChat={() => setView('plan-chat')}
       />
     )
 
@@ -1660,6 +1937,7 @@ export default function LiftLog() {
         muscleGroup={pickerMuscle}
         workouts={workouts}
         favorites={favorites}
+        thumbs={thumbs}
         onToggleFavorite={toggleFavorite}
         onBack={() => {
           setPickerMuscle(null)
@@ -1679,13 +1957,20 @@ export default function LiftLog() {
         muscleGroup={entryExercise.muscleGroup}
         workouts={workouts}
         bodyWeight={bodyWeight}
+        active={active}
+        units={units}
+        readiness={
+          typeof active?.readiness === 'number'
+            ? active.readiness / 100
+            : null
+        }
         onBack={() => {
           setEntryExercise(null)
           setView('log-picker')
         }}
-        onFinish={(sets, equipment) =>
+        onFinish={(sets, equipment, finalExerciseName) =>
           logWorkout(
-            entryExercise.exercise,
+            finalExerciseName || entryExercise.exercise,
             entryExercise.muscleGroup,
             sets,
             equipment,
@@ -1781,6 +2066,14 @@ export default function LiftLog() {
         workouts={workouts}
         bodyWeight={bodyWeight}
         isFavorite={isFavorite(viewingExercise)}
+        thumb={thumbs[viewingExercise]}
+        unit={exerciseUnit(viewingExercise, units)}
+        onSetThumb={(d) => setThumb(viewingExercise, d)}
+        onSetUnit={(u) => setUnit(viewingExercise, u)}
+        onRename={(newName) => {
+          renameOrMergeExercise(viewingExercise, newName)
+          setViewingExercise(newName)
+        }}
         onToggleFavorite={() => toggleFavorite(viewingExercise)}
         onBack={() => {
           setViewingExercise(null)
@@ -1796,10 +2089,29 @@ export default function LiftLog() {
         workouts={workouts}
         sessions={sessions}
         bodyWeight={bodyWeight}
+        apiKey={apiKey}
+        onChangeApiKey={setApiKey}
         onChangeBodyWeight={setBodyWeight}
+        onRenameExercise={renameOrMergeExercise}
         onBack={() => setView('home')}
         onImport={importData}
         onReset={resetAllData}
+      />
+    )
+
+  if (view === 'plan-chat')
+    return (
+      <PlanChatScreen
+        plan={resolvedPlan}
+        workouts={workouts}
+        sessions={sessions}
+        apiKey={apiKey}
+        onOpenSettings={() => setView('settings')}
+        onBack={() => setView('home')}
+        onApply={(edited) => {
+          setPlanDraft(edited)
+          setView('home')
+        }}
       />
     )
 
@@ -1858,6 +2170,8 @@ function HomeScreen({
   sessions,
   plan,
   planIsDraft,
+  thumbs = {},
+  hasApiKey = false,
   onStart,
   onResume,
   onSessions,
@@ -1865,6 +2179,7 @@ function HomeScreen({
   onExercise,
   onSettings,
   onEditPlan,
+  onPlanChat,
 }) {
   const weekAgo = Date.now() - 7 * 86400000
   const weekWorkouts = workouts.filter((w) => w.date >= weekAgo)
@@ -1940,6 +2255,8 @@ function HomeScreen({
           plan={plan}
           title={planIsDraft ? "Today's plan · edited" : "Today's plan"}
           onEdit={onEditPlan}
+          onChat={onPlanChat}
+          chatLabel={hasApiKey ? 'Chat' : 'Chat (setup)'}
         />
       )}
 
@@ -2026,6 +2343,8 @@ function PlanCard({
   completedExercises = null,
   onPickExercise = null,
   onEdit = null,
+  onChat = null,
+  chatLabel = 'Chat',
 }) {
   const interactive = typeof onPickExercise === 'function'
   const day = titleCase(plan.dayType)
@@ -2038,6 +2357,16 @@ function PlanCard({
           <div className="text-xs text-zinc-500 tabular-nums">
             ~{plan.estimatedMinutes} min
           </div>
+          {onChat && (
+            <button
+              onClick={onChat}
+              className="px-2 py-1 text-xs font-medium text-emerald-300 bg-emerald-950/60 rounded-md active:bg-emerald-900/60 flex items-center gap-1 ring-1 ring-emerald-900/40"
+              aria-label="Chat to adjust plan"
+            >
+              <Sparkles size={11} />
+              {chatLabel}
+            </button>
+          )}
           {onEdit && (
             <button
               onClick={onEdit}
@@ -2473,6 +2802,7 @@ function LogPickerScreen({
   muscleGroup,
   workouts,
   favorites = [],
+  thumbs = {},
   onToggleFavorite,
   onBack,
   onPick,
@@ -2522,30 +2852,47 @@ function LogPickerScreen({
       </h1>
       <p className="mt-1 text-sm text-zinc-500">Pick an exercise</p>
 
-      <div className="mt-5 bg-zinc-900/40 rounded-2xl divide-y divide-zinc-800/60 overflow-hidden">
+      <div className="mt-5 grid grid-cols-2 gap-2.5">
         {sorted.map((ex) => {
           const last = lastSummary(ex)
           const fav = favSet.has(ex)
           return (
-            <div key={ex} className="flex items-stretch">
+            <div
+              key={ex}
+              className="relative bg-zinc-900/60 rounded-2xl overflow-hidden ring-1 ring-zinc-800/60 active:bg-zinc-800/60"
+            >
               <button
                 onClick={() => onPick(ex)}
-                className="min-w-0 flex-1 text-left px-4 py-3 active:bg-zinc-800/40"
+                className="w-full text-left"
               >
-                <div className="text-sm font-semibold truncate">{ex}</div>
-                <div className="text-xs text-zinc-500 mt-0.5">
-                  {last ? `Last: ${last}` : 'Never logged'}
+                <div className="w-full h-28 relative">
+                  <ExerciseThumbnail
+                    exercise={ex}
+                    muscleGroup={muscleGroup}
+                    thumbs={thumbs}
+                    fill
+                    iconSize={40}
+                    className="w-full h-full"
+                  />
+                </div>
+                <div className="px-3 py-2.5">
+                  <div className="text-sm font-semibold leading-tight line-clamp-2 min-h-[2.4em]">
+                    {ex}
+                  </div>
+                  <div className="text-[11px] text-zinc-500 mt-1 truncate">
+                    {last ? `Last: ${last}` : 'Never logged'}
+                  </div>
                 </div>
               </button>
               <button
                 onClick={() => onToggleFavorite?.(ex)}
-                className="px-3 active:opacity-70 shrink-0"
+                className="absolute top-1.5 right-1.5 p-1.5 rounded-full bg-zinc-950/60 active:opacity-70"
                 aria-label={fav ? 'Unstar' : 'Star'}
               >
                 <Star
-                  size={16}
+                  size={14}
                   className={
-                    fav ? 'text-amber-400 fill-amber-400' : 'text-zinc-600'
+                    fav ? 'text-amber-400 fill-amber-400' : 'text-zinc-400'
                   }
                 />
               </button>
@@ -2611,10 +2958,13 @@ function LogEntryScreen({
   muscleGroup,
   workouts,
   bodyWeight,
+  active,
+  units,
+  readiness = null,
   onBack,
   onFinish,
 }) {
-  const rec = getRecommendation(exercise, muscleGroup, workouts)
+  const rec = getRecommendation(exercise, muscleGroup, workouts, { readiness })
   const lastWorkout = lastOccurrence(exercise, workouts)
   const lastSets = lastWorkout?.sets || []
 
@@ -2625,6 +2975,11 @@ function LogEntryScreen({
     'barbell'
   const [equipment, setEquipment] = useState(initialEquipment)
 
+  // Per-exercise mode (reps vs seconds). Defaults from metadata/user override.
+  const exerciseDefaultUnit = exerciseUnit(exercise, units)
+  const [unit, setUnitLocal] = useState(exerciseDefaultUnit)
+  const isTime = unit === 'seconds'
+
   // L/R toggle — auto-on if the previous workout had repsLeft
   const initialUnilateral = lastSets.some(
     (s) => s.repsLeft !== undefined && s.repsLeft !== null,
@@ -2634,12 +2989,19 @@ function LogEntryScreen({
   const [completed, setCompleted] = useState([])
 
   const bw = isBodyweight(equipment)
+  const showVariant = equipment === 'machine' || equipment === 'cable'
+  const [variant, setVariant] = useState('')
 
-  const initialWeight = rec?.weight || lastSets[0]?.weight || 0
-  const initialReps = rec?.reps || lastSets[0]?.reps || 10
-  const [weight, setWeight] = useState(bw ? 0 : initialWeight)
-  const [reps, setReps] = useState(initialReps)
-  const [repsLeft, setRepsLeft] = useState(initialReps)
+  // Goal-based defaults: weight/reps reflect the recommendation, not the
+  // previous result. Falls back to last only when there's no rec at all.
+  const goalWeight = rec?.weight ?? lastSets[0]?.weight ?? 0
+  const goalReps = rec?.reps ?? 10
+  const goalDuration = isTime ? lastSets[0]?.duration || 30 : 0
+
+  const [weight, setWeight] = useState(bw ? 0 : goalWeight)
+  const [reps, setReps] = useState(goalReps)
+  const [repsLeft, setRepsLeft] = useState(goalReps)
+  const [duration, setDuration] = useState(goalDuration || 30)
 
   // Rest timer
   const [restEndTime, setRestEndTime] = useState(null)
@@ -2647,11 +3009,13 @@ function LogEntryScreen({
   const [now, setNow] = useState(Date.now())
   const vibratedRef = useRef(false)
 
+  // Tick at 1Hz when either the rest timer is running or there's an active
+  // session — this drives the live stats banner.
   useEffect(() => {
-    if (!restEndTime) return
-    const id = setInterval(() => setNow(Date.now()), 250)
+    if (!restEndTime && !active) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(id)
-  }, [restEndTime])
+  }, [restEndTime, active])
 
   useEffect(() => {
     if (!restEndTime) return
@@ -2692,20 +3056,26 @@ function LogEntryScreen({
 
   function recordSet() {
     const w = Number(weight) || 0
-    const r = Number(reps) || 0
-    const rL = Number(repsLeft) || 0
-    if (r <= 0 && rL <= 0) return
-    const newSet = { weight: w, reps: r, time: Date.now() }
-    if (unilateral) newSet.repsLeft = rL
-    const next = [...completed, newSet]
-    setCompleted(next)
-    const nextPrev = lastSets[next.length]
-    if (nextPrev) {
-      setWeight(Number(nextPrev.weight) || w)
-      setReps(Number(nextPrev.reps) || r)
-      if (unilateral)
-        setRepsLeft(Number(nextPrev.repsLeft) || Number(nextPrev.reps) || rL)
+    if (isTime) {
+      const d = Number(duration) || 0
+      if (d <= 0) return
+      const newSet = { weight: w, reps: 0, duration: d, time: Date.now() }
+      setCompleted((prev) => [...prev, newSet])
+    } else {
+      const r = Number(reps) || 0
+      const rL = Number(repsLeft) || 0
+      if (r <= 0 && rL <= 0) return
+      const newSet = { weight: w, reps: r, time: Date.now() }
+      if (unilateral) newSet.repsLeft = rL
+      setCompleted((prev) => [...prev, newSet])
     }
+    // Defaults for the next set: stay on the goal — don't drift back to the
+    // previous workout's matching set (which is what caused weight to "reset"
+    // between sets before).
+    if (!bw) setWeight(goalWeight)
+    setReps(goalReps)
+    setRepsLeft(goalReps)
+    if (isTime) setDuration(goalDuration || duration)
     startTimer(restDuration)
   }
 
@@ -2713,8 +3083,18 @@ function LogEntryScreen({
     setWeight((prev) => Math.max(0, (Number(prev) || 0) + delta))
   }
 
+  function adjustDuration(delta) {
+    setDuration((prev) => Math.max(5, (Number(prev) || 0) + delta))
+  }
+
   function finish() {
-    onFinish(completed, equipment)
+    // Bake the machine variant into the exercise name so history splits per
+    // machine. Only applies when the user typed something AND equipment is
+    // machine/cable.
+    const trimmed = (variant || '').trim()
+    const finalName =
+      showVariant && trimmed ? `${exercise} — ${trimmed}` : null
+    onFinish(completed, equipment, finalName)
   }
 
   function removeCompletedSet(idx) {
@@ -2724,6 +3104,26 @@ function LogEntryScreen({
   const plates = isBarbell(equipment) ? platesPerSide(Number(weight)) : null
   const weightLabel = bw ? 'Added (lb)' : 'Weight (lb)'
 
+  // Session stats banner — combines the session-so-far with this in-progress
+  // exercise's completed sets and a projected volume contribution.
+  const sessionWorkouts = active
+    ? active.workouts
+        .map((id) => workouts.find((w) => w.id === id))
+        .filter(Boolean)
+    : []
+  const sessionLifts = sessionWorkouts.length
+  const sessionSets =
+    sessionWorkouts.reduce((s, w) => s + (w.sets?.length || 0), 0) +
+    completed.length
+  const sessionVol =
+    sessionWorkouts.reduce((s, w) => s + workoutVolume(w), 0) +
+    completed.reduce(
+      (s, st) =>
+        s + setEffectiveWeight(st, equipment, bodyWeight) * setWorkUnits(st),
+      0,
+    )
+  const elapsedMs = active ? now - active.startTime : 0
+
   return (
     <Shell>
       <SleekBackBar onBack={onBack} title={muscleGroup} />
@@ -2732,14 +3132,43 @@ function LogEntryScreen({
         {exercise}
       </h1>
 
-      {/* Equipment picker */}
+      {/* Live session stats — only if we're in an active session */}
+      {active && (
+        <div className="mt-3 bg-zinc-900/60 rounded-xl px-3 py-2.5 flex items-center justify-between text-xs">
+          <span className="flex items-center gap-1.5 text-emerald-400">
+            <Clock size={12} />
+            <span className="font-mono tabular-nums">
+              {formatElapsed(elapsedMs)}
+            </span>
+          </span>
+          <span className="text-zinc-500">
+            <span className="text-zinc-200 font-semibold tabular-nums">
+              {sessionLifts}
+            </span>{' '}
+            lifts
+          </span>
+          <span className="text-zinc-500">
+            <span className="text-zinc-200 font-semibold tabular-nums">
+              {sessionSets}
+            </span>{' '}
+            sets
+          </span>
+          <span className="text-zinc-500">
+            <span className="text-zinc-200 font-semibold tabular-nums">
+              {formatVolume(Math.round(sessionVol))}
+            </span>{' '}
+            vol
+          </span>
+        </div>
+      )}
+
+      {/* Equipment + unit pickers */}
       <div className="mt-3 flex flex-wrap gap-1.5">
         {EQUIPMENT_TYPES.map((e) => (
           <button
             key={e}
             onClick={() => {
               setEquipment(e)
-              // When switching to BW, default the weight to 0 (added load)
               if (e === 'bodyweight' && Number(weight) === 0) setWeight(0)
             }}
             className={`px-3 py-1.5 rounded-lg text-xs font-medium ${
@@ -2751,14 +3180,45 @@ function LogEntryScreen({
             {EQUIPMENT_LABEL[e]}
           </button>
         ))}
+        <button
+          onClick={() => setUnitLocal(isTime ? 'reps' : 'seconds')}
+          className={`px-3 py-1.5 rounded-lg text-xs font-medium ${
+            isTime
+              ? 'bg-amber-600 text-zinc-950'
+              : 'bg-zinc-900/60 text-zinc-400 active:bg-zinc-800/60'
+          }`}
+          title="Switch between reps and time"
+        >
+          {isTime ? 'Time' : 'Reps'}
+        </button>
       </div>
 
-      {rec && !bw && (
+      {/* Optional machine variant */}
+      {showVariant && (
+        <div className="mt-3 bg-zinc-900/60 rounded-xl p-3">
+          <div className="text-[10px] text-zinc-500 font-medium tracking-wide uppercase">
+            Machine / brand <span className="opacity-60">— optional</span>
+          </div>
+          <input
+            type="text"
+            value={variant}
+            onChange={(e) => setVariant(e.target.value)}
+            placeholder="e.g. Hammer Strength"
+            className="mt-1.5 w-full bg-zinc-950/60 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-600 placeholder:text-zinc-600 ring-1 ring-zinc-800/50"
+          />
+          <p className="mt-1.5 text-[11px] text-zinc-500 leading-snug">
+            Different machines won't translate weight-for-weight — naming the
+            machine keeps history separate per piece of equipment.
+          </p>
+        </div>
+      )}
+
+      {rec && !bw && !isTime && (
         <div
           className={`mt-3 rounded-xl px-3 py-2 text-xs font-medium ${
             rec.type === 'increase'
               ? 'bg-emerald-950/40 text-emerald-400 ring-1 ring-emerald-900/40'
-              : rec.type === 'deload'
+              : rec.type === 'deload' || rec.type === 'hold'
                 ? 'bg-orange-950/30 text-orange-400 ring-1 ring-orange-900/40'
                 : 'bg-zinc-900/60 text-zinc-400'
           }`}
@@ -2786,27 +3246,34 @@ function LogEntryScreen({
           {lastSets[setIndex - 1] && (
             <div className="text-xs text-zinc-500 font-mono tabular-nums">
               Last:{' '}
-              {lastSets[setIndex - 1].repsLeft !== undefined
-                ? `${lastSets[setIndex - 1].reps}R/${lastSets[setIndex - 1].repsLeft}L`
-                : `${lastSets[setIndex - 1].reps}`}
-              ×{lastSets[setIndex - 1].weight}
+              {formatSet(
+                lastSets[setIndex - 1],
+                exerciseEquip(exercise, lastWorkout?.equipment),
+              )}
             </div>
           )}
-          <button
-            onClick={() => setUnilateral((v) => !v)}
-            className={`px-2 py-1 rounded-md text-[11px] font-semibold ${
-              unilateral
-                ? 'bg-emerald-600 text-zinc-950'
-                : 'bg-zinc-900/60 text-zinc-400'
-            }`}
-          >
-            L/R
-          </button>
+          {!isTime && (
+            <button
+              onClick={() => setUnilateral((v) => !v)}
+              className={`px-2 py-1 rounded-md text-[11px] font-semibold ${
+                unilateral
+                  ? 'bg-emerald-600 text-zinc-950'
+                  : 'bg-zinc-900/60 text-zinc-400'
+              }`}
+            >
+              L/R
+            </button>
+          )}
         </div>
       </div>
 
       {/* Inputs */}
-      {unilateral ? (
+      {isTime ? (
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <BigField label={weightLabel} value={weight} onChange={setWeight} />
+          <BigField label="Time (s)" value={duration} onChange={setDuration} />
+        </div>
+      ) : unilateral ? (
         <div className="mt-3 grid grid-cols-3 gap-2">
           <BigField label={weightLabel} value={weight} onChange={setWeight} />
           <BigField label="Right" value={reps} onChange={setReps} />
@@ -2841,15 +3308,16 @@ function LogEntryScreen({
         ) : null}
       </div>
 
-      {/* Weight adjust buttons */}
+      {/* Weight / duration quick adjust */}
       <div className="mt-2 grid grid-cols-4 gap-2">
-        {[-10, -5, 5, 10].map((d) => (
+        {(isTime ? [-15, -5, 5, 15] : [-10, -5, 5, 10]).map((d) => (
           <button
             key={d}
-            onClick={() => adjustWeight(d)}
+            onClick={() => (isTime ? adjustDuration(d) : adjustWeight(d))}
             className="py-3 rounded-xl bg-zinc-900/60 text-sm font-medium active:bg-zinc-800/60 tabular-nums"
           >
             {d > 0 ? `+${d}` : d}
+            {isTime && <span className="text-[10px] text-zinc-500">s</span>}
           </button>
         ))}
       </div>
@@ -2865,11 +3333,7 @@ function LogEntryScreen({
           >
             <Check size={10} />
             <span className="font-mono tabular-nums">
-              Set {i + 1} ·{' '}
-              {s.repsLeft !== undefined
-                ? `${s.reps}R/${s.repsLeft}L`
-                : s.reps}
-              ×{s.weight}
+              Set {i + 1} · {formatSet(s, equipment)}
             </span>
             <X size={10} className="ml-0.5 opacity-60" />
           </button>
@@ -3130,15 +3594,19 @@ function SessionCompleteScreen({
         <div className="text-xs text-zinc-500 font-medium">
           Score breakdown
         </div>
-        <div className="mt-2 bg-zinc-900/60 rounded-2xl p-4 space-y-3">
-          {Object.values(session.scoreBreakdown).map((b) => (
-            <ScoreBar
-              key={b.label}
+        <div className="mt-2 bg-zinc-900/60 rounded-2xl p-4 space-y-2">
+          {Object.entries(session.scoreBreakdown).map(([key, b]) => (
+            <ExpandableScoreBar
+              key={key}
               label={titleCase(b.label.toLowerCase())}
               value={b.value}
               max={b.max}
+              description={SCORE_DESCRIPTIONS[key]}
             />
           ))}
+          <p className="text-[11px] text-zinc-600 leading-snug pt-1">
+            Tap a row for what it measures and how it's scored.
+          </p>
         </div>
       </div>
 
@@ -3226,6 +3694,47 @@ function ScoreBar({ label, value, max }) {
           style={{ width: `${pct}%` }}
         />
       </div>
+    </div>
+  )
+}
+
+function ExpandableScoreBar({ label, value, max, description }) {
+  const [open, setOpen] = useState(false)
+  const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0
+  return (
+    <div>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full text-left py-1 active:opacity-70"
+      >
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-zinc-400 flex items-center gap-1">
+            {label}
+            {description && (
+              <ChevronDown
+                size={11}
+                className={`text-zinc-600 transition-transform ${
+                  open ? 'rotate-180' : ''
+                }`}
+              />
+            )}
+          </span>
+          <span className="text-zinc-300 font-mono tabular-nums">
+            {value}/{max}
+          </span>
+        </div>
+        <div className="mt-1 h-1.5 bg-zinc-950/50 rounded-full overflow-hidden">
+          <div
+            className="h-full bg-emerald-500 rounded-full transition-[width] duration-300"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      </button>
+      {open && description && (
+        <p className="mt-1.5 mb-1 text-[11px] text-zinc-500 leading-relaxed">
+          {description}
+        </p>
+      )}
     </div>
   )
 }
@@ -3525,12 +4034,13 @@ function SessionDetailScreen({
         <div className="mt-5">
           <Label>BREAKDOWN</Label>
           <div className="mt-2 space-y-2">
-            {Object.values(session.scoreBreakdown).map((b) => (
-              <ScoreBar
-                key={b.label}
+            {Object.entries(session.scoreBreakdown).map(([key, b]) => (
+              <ExpandableScoreBar
+                key={key}
                 label={b.label}
                 value={b.value}
                 max={b.max}
+                description={SCORE_DESCRIPTIONS[key]}
               />
             ))}
           </div>
@@ -3702,12 +4212,20 @@ function ExerciseDetailScreen({
   workouts,
   bodyWeight = 0,
   isFavorite = false,
+  thumb,
+  unit = 'reps',
+  onSetThumb,
+  onSetUnit,
+  onRename,
   onToggleFavorite,
   onBack,
 }) {
   const matches = workouts.filter((w) => w.exercise === exercise)
   const sorted = [...matches].sort((a, b) => b.date - a.date)
   const muscleGroup = sorted[0]?.muscleGroup || ''
+  const fileRef = useRef(null)
+  const [renaming, setRenaming] = useState(false)
+  const [newName, setNewName] = useState(exercise)
 
   // PR: best set weight overall (with reps), and which workout it belongs to
   let pr = { weight: 0, reps: 0, workoutId: null }
@@ -3735,20 +4253,136 @@ function ExerciseDetailScreen({
 
   const rec = getRecommendation(exercise, muscleGroup, workouts)
 
+  // Resize + compress on upload to keep localStorage manageable
+  function handlePhoto(file) {
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const img = new Image()
+      img.onload = () => {
+        const max = 512
+        const scale = Math.min(1, max / Math.max(img.width, img.height))
+        const w = Math.round(img.width * scale)
+        const h = Math.round(img.height * scale)
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(img, 0, 0, w, h)
+        try {
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.78)
+          onSetThumb?.(dataUrl)
+        } catch {
+          onSetThumb?.(e.target.result)
+        }
+      }
+      img.src = e.target.result
+    }
+    reader.readAsDataURL(file)
+  }
+
   return (
     <Shell>
       <TopBar onBack={onBack} title="EXERCISE" />
 
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <div className="font-display text-3xl tracking-tight leading-none">
-            {exercise.toUpperCase()}
-          </div>
-          {muscleGroup && (
+      <div className="flex items-start gap-3">
+        <button
+          onClick={() => fileRef.current?.click()}
+          className="shrink-0 active:opacity-80"
+          aria-label="Set thumbnail"
+        >
+          <ExerciseThumbnail
+            exercise={exercise}
+            muscleGroup={muscleGroup}
+            thumbs={thumb ? { [exercise]: thumb } : {}}
+            size={72}
+            iconSize={30}
+          />
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          className="hidden"
+          onChange={(e) => handlePhoto(e.target.files?.[0])}
+        />
+        <div className="min-w-0 flex-1">
+          {renaming ? (
+            <div className="flex items-center gap-1">
+              <input
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                className="flex-1 bg-zinc-950/60 rounded-lg px-2 py-1.5 text-sm font-semibold ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+                autoFocus
+              />
+              <button
+                onClick={() => {
+                  if (newName.trim() && newName.trim() !== exercise) {
+                    onRename?.(newName.trim())
+                  }
+                  setRenaming(false)
+                }}
+                className="px-2 py-1.5 rounded-md text-xs font-semibold bg-emerald-600 text-zinc-950 active:bg-emerald-500"
+              >
+                Save
+              </button>
+              <button
+                onClick={() => {
+                  setRenaming(false)
+                  setNewName(exercise)
+                }}
+                className="px-2 py-1.5 rounded-md text-xs text-zinc-500"
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <div className="font-display text-2xl tracking-tight leading-tight break-words">
+              {exercise.toUpperCase()}
+            </div>
+          )}
+          {muscleGroup && !renaming && (
             <div className="mt-1 text-[11px] tracking-[0.2em] text-zinc-500">
               {muscleGroup.toUpperCase()}
             </div>
           )}
+          <div className="mt-2 flex items-center flex-wrap gap-1.5 text-[11px]">
+            <button
+              onClick={() => fileRef.current?.click()}
+              className="px-2 py-1 rounded-md bg-zinc-900/60 text-zinc-300 active:bg-zinc-800/60"
+            >
+              {thumb ? 'Change photo' : 'Add photo'}
+            </button>
+            {thumb && (
+              <button
+                onClick={() => onSetThumb?.(null)}
+                className="px-2 py-1 rounded-md text-zinc-500 active:text-red-400"
+              >
+                Remove
+              </button>
+            )}
+            {onRename && (
+              <button
+                onClick={() => setRenaming((v) => !v)}
+                className="px-2 py-1 rounded-md bg-zinc-900/60 text-zinc-300 active:bg-zinc-800/60 flex items-center gap-1"
+              >
+                <Pencil size={11} /> Rename / merge
+              </button>
+            )}
+            {onSetUnit && (
+              <button
+                onClick={() => onSetUnit(unit === 'seconds' ? 'reps' : 'seconds')}
+                className={`px-2 py-1 rounded-md ${
+                  unit === 'seconds'
+                    ? 'bg-amber-600 text-zinc-950'
+                    : 'bg-zinc-900/60 text-zinc-300'
+                } active:opacity-80`}
+              >
+                {unit === 'seconds' ? 'Time mode' : 'Reps mode'}
+              </button>
+            )}
+          </div>
         </div>
         {onToggleFavorite && (
           <button
@@ -3865,7 +4499,10 @@ function SettingsScreen({
   workouts,
   sessions,
   bodyWeight,
+  apiKey = '',
+  onChangeApiKey,
   onChangeBodyWeight,
+  onRenameExercise,
   onBack,
   onImport,
   onReset,
@@ -3875,7 +4512,29 @@ function SettingsScreen({
   const [pasteOpen, setPasteOpen] = useState(false)
   const [csvRange, setCsvRange] = useState(30) // days; 0 = all
   const [bwInput, setBwInput] = useState(String(bodyWeight || ''))
+  const [keyInput, setKeyInput] = useState(apiKey || '')
+  const [keyVisible, setKeyVisible] = useState(false)
+  const [libraryOpen, setLibraryOpen] = useState(false)
+  const [renamingExercise, setRenamingExercise] = useState(null)
+  const [renameValue, setRenameValue] = useState('')
   const fileInputRef = useRef(null)
+
+  useEffect(() => {
+    setKeyInput(apiKey || '')
+  }, [apiKey])
+
+  // Distinct exercises in history with counts
+  const exerciseStats = useMemo(() => {
+    const map = new Map()
+    for (const w of workouts) {
+      const cur = map.get(w.exercise) || { count: 0, muscleGroup: w.muscleGroup }
+      cur.count += 1
+      map.set(w.exercise, cur)
+    }
+    return Array.from(map.entries())
+      .map(([name, info]) => ({ name, ...info }))
+      .sort((a, b) => b.count - a.count)
+  }, [workouts])
 
   useEffect(() => {
     setBwInput(String(bodyWeight || ''))
@@ -4247,6 +4906,143 @@ function SettingsScreen({
         <p className="mt-2 text-xs text-zinc-500">
           One row per set. Opens cleanly in Excel and Google Sheets.
         </p>
+      </div>
+
+      {/* Exercise library — rename + merge */}
+      <div className="mt-8 text-xs text-zinc-500 font-medium">
+        Exercise library
+      </div>
+      <button
+        onClick={() => setLibraryOpen((v) => !v)}
+        className="mt-2 w-full py-3 rounded-xl bg-zinc-900/60 text-sm font-semibold flex items-center justify-between px-4 active:bg-zinc-800/60"
+      >
+        <span>
+          {exerciseStats.length} exercise{exerciseStats.length === 1 ? '' : 's'}{' '}
+          tracked
+        </span>
+        {libraryOpen ? (
+          <ChevronUp size={16} className="text-zinc-500" />
+        ) : (
+          <ChevronDown size={16} className="text-zinc-500" />
+        )}
+      </button>
+      {libraryOpen && (
+        <div className="mt-2 bg-zinc-900/40 rounded-2xl divide-y divide-zinc-800/60 overflow-hidden">
+          {exerciseStats.length === 0 && (
+            <div className="px-4 py-4 text-sm text-zinc-500">
+              No exercises logged yet.
+            </div>
+          )}
+          {exerciseStats.map((e) => (
+            <div key={e.name} className="px-3 py-2.5">
+              {renamingExercise === e.name ? (
+                <div>
+                  <div className="text-xs text-zinc-500 font-medium">
+                    Rename {e.name}
+                  </div>
+                  <input
+                    value={renameValue}
+                    onChange={(ev) => setRenameValue(ev.target.value)}
+                    placeholder="New name (matching existing = merge)"
+                    className="mt-1.5 w-full bg-zinc-950/60 rounded-lg px-2.5 py-2 text-sm ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600"
+                    autoFocus
+                  />
+                  <p className="mt-1.5 text-[11px] text-zinc-500 leading-snug">
+                    Typing an existing name (e.g. "Deadlift") will merge all{' '}
+                    {e.count} entries into it — history is preserved.
+                  </p>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => {
+                        setRenamingExercise(null)
+                        setRenameValue('')
+                      }}
+                      className="py-2 rounded-lg bg-zinc-900/60 text-xs font-medium"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => {
+                        const v = renameValue.trim()
+                        if (v && v !== e.name) {
+                          onRenameExercise?.(e.name, v)
+                        }
+                        setRenamingExercise(null)
+                        setRenameValue('')
+                      }}
+                      className="py-2 rounded-lg bg-emerald-600 text-zinc-950 text-xs font-bold active:bg-emerald-500"
+                    >
+                      Save
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold truncate">
+                      {e.name}
+                    </div>
+                    <div className="text-[11px] text-zinc-500 mt-0.5 tabular-nums">
+                      {e.count} entr{e.count === 1 ? 'y' : 'ies'}
+                      {e.muscleGroup ? ` · ${e.muscleGroup}` : ''}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setRenamingExercise(e.name)
+                      setRenameValue(e.name)
+                    }}
+                    className="px-2.5 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-800/60 rounded-md active:bg-zinc-700/60 flex items-center gap-1 shrink-0"
+                  >
+                    <Pencil size={11} />
+                    Rename
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Anthropic API key (for the LLM pre-session chat) */}
+      <div className="mt-8 text-xs text-zinc-500 font-medium">
+        Plan chat (Anthropic API key)
+      </div>
+      <div className="mt-2 bg-zinc-900/60 rounded-2xl p-4">
+        <div className="flex items-center gap-2">
+          <input
+            type={keyVisible ? 'text' : 'password'}
+            value={keyInput}
+            onChange={(e) => setKeyInput(e.target.value)}
+            onBlur={() => {
+              if (keyInput !== apiKey) onChangeApiKey?.(keyInput.trim())
+            }}
+            placeholder="sk-ant-..."
+            className="flex-1 bg-zinc-950/60 rounded-lg px-3 py-2.5 text-sm font-mono ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600 placeholder:text-zinc-600"
+          />
+          <button
+            onClick={() => setKeyVisible((v) => !v)}
+            className="px-2.5 py-2 rounded-lg bg-zinc-900/60 text-xs"
+          >
+            {keyVisible ? 'Hide' : 'Show'}
+          </button>
+        </div>
+        <p className="mt-2 text-[11px] text-zinc-500 leading-relaxed">
+          Enables the pre-session "Adjust plan" chat. Key is stored only in this
+          browser's localStorage and sent directly to Anthropic from your
+          device. Get one at console.anthropic.com.
+        </p>
+        {apiKey && (
+          <button
+            onClick={() => {
+              onChangeApiKey?.('')
+              setKeyInput('')
+            }}
+            className="mt-2 text-[11px] text-zinc-500 active:text-red-400"
+          >
+            Remove key
+          </button>
+        )}
       </div>
 
       <div className="mt-8 text-xs text-zinc-500 font-medium">
@@ -4773,6 +5569,426 @@ function PlanEditorScreen({ plan, isDraft, onBack, onSave, onReset }) {
           className={`py-3 rounded-xl text-sm bg-emerald-600 text-zinc-950 font-semibold active:bg-emerald-500 ${isDraft ? '' : 'col-span-2'}`}
         >
           Save plan
+        </button>
+      </div>
+    </Shell>
+  )
+}
+
+// ============================================================
+// PLAN CHAT (LLM)
+// ============================================================
+
+const PLAN_CHAT_SYSTEM = `You are an in-app fitness coach helping the user adjust today's strength workout plan before they start training. The user follows a hybrid push/pull/legs split and uses this app to log lifts.
+
+You will be given:
+- Today's currently-suggested plan (exercises, sets, reps, muscle groups)
+- A summary of recent training (last 14 days, grouped by muscle group)
+- The catalog of exercises available in the app for each muscle group
+
+When the user asks to adjust the plan, you MUST use the propose_plan tool to return the full replacement exercise list (in order). Do not omit exercises the user wants to keep — return the entire ordered list every time.
+
+Rules for proposing a plan:
+- Only use exercise names that already exist in the app catalog OR that the user explicitly names (custom names are OK if they're specific, e.g. "Cable Chest Press — Hammer Strength").
+- Honor any restrictions the user mentions (soreness, time available, equipment unavailable). If they say their lower back is tight, avoid Deadlift and Bent-Over Row.
+- Keep total exercises in 4–7 range unless the user explicitly wants more/fewer.
+- Lead each muscle group with a compound when one fits.
+- Reps default to 10. Sets default to 3 (4 for anchor compounds).
+- Set muscleGroup to one of: Chest, Back, Shoulders, Arms, Legs, Core.
+
+Tone: concise, practical, no fluff. After proposing changes, give a short (1–2 sentence) rationale describing what changed and why. When the user is just chatting or asking questions, answer briefly without calling the tool.`
+
+const PLAN_TOOL = {
+  name: 'propose_plan',
+  description:
+    "Replace the workout plan with a new ordered list of exercises. Always return the FULL list, not a diff.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      exercises: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            exercise: {
+              type: 'string',
+              description: 'Exercise name (use catalog names when possible).',
+            },
+            muscleGroup: {
+              type: 'string',
+              enum: ['Chest', 'Back', 'Shoulders', 'Arms', 'Legs', 'Core'],
+            },
+            sets: { type: 'integer', minimum: 1, maximum: 6 },
+            reps: { type: 'integer', minimum: 1, maximum: 30 },
+            isAnchor: { type: 'boolean' },
+          },
+          required: ['exercise', 'muscleGroup', 'sets', 'reps'],
+        },
+      },
+      rationale: {
+        type: 'string',
+        description: 'One short sentence describing what changed.',
+      },
+    },
+    required: ['exercises'],
+  },
+}
+
+function buildPlanChatContext(plan, workouts) {
+  const cutoff = Date.now() - 14 * 86400000
+  const recent = workouts.filter((w) => w.date >= cutoff)
+  const byGroup = {}
+  for (const g of MUSCLE_GROUPS) byGroup[g] = []
+  for (const w of recent) {
+    if (!byGroup[w.muscleGroup]) continue
+    const top = w.sets.reduce(
+      (b, s) => (Number(s.weight) || 0) > b ? Number(s.weight) || 0 : b,
+      0,
+    )
+    byGroup[w.muscleGroup].push({
+      date: daysSince(w.date),
+      exercise: w.exercise,
+      sets: w.sets.length,
+      topWeight: top,
+    })
+  }
+  const recentSummary = MUSCLE_GROUPS.map((g) => {
+    const items = byGroup[g] || []
+    if (items.length === 0) return `${g}: nothing in 14d`
+    const list = items
+      .slice(0, 4)
+      .map((i) => `${i.exercise} ${i.sets}×${i.topWeight || '-'} (${i.date}d)`)
+      .join(', ')
+    return `${g}: ${list}`
+  }).join('\n')
+
+  const catalog = MUSCLE_GROUPS.map(
+    (g) => `${g}: ${(EXERCISES[g] || []).join(', ')}`,
+  ).join('\n')
+
+  const planText = plan.exercises
+    .map(
+      (e, i) =>
+        `${i + 1}. ${e.exercise} (${e.muscleGroup}) — ${e.sets} × ${e.reps}${e.isAnchor ? ' [anchor]' : ''}`,
+    )
+    .join('\n')
+
+  return `Today's plan (${titleCase(plan.dayType)}, focus: ${plan.focus.join(' + ')}):
+${planText}
+
+Recent training (last 14d):
+${recentSummary}
+
+Exercise catalog:
+${catalog}`
+}
+
+async function callPlanChat(apiKey, history, plan, workouts) {
+  const context = buildPlanChatContext(plan, workouts)
+  const system = [
+    { type: 'text', text: PLAN_CHAT_SYSTEM },
+    {
+      type: 'text',
+      text: context,
+      cache_control: { type: 'ephemeral' },
+    },
+  ]
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1024,
+      system,
+      tools: [PLAN_TOOL],
+      messages: history,
+    }),
+  })
+  if (!res.ok) {
+    let detail = ''
+    try {
+      detail = await res.text()
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`Anthropic API ${res.status}: ${detail.slice(0, 240)}`)
+  }
+  return res.json()
+}
+
+function PlanChatScreen({
+  plan,
+  workouts,
+  apiKey,
+  onOpenSettings,
+  onBack,
+  onApply,
+}) {
+  const [messages, setMessages] = useState([])
+  const [input, setInput] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const [proposed, setProposed] = useState(null)
+  const [rationale, setRationale] = useState('')
+  const scrollerRef = useRef(null)
+
+  useEffect(() => {
+    // Scroll to bottom on new message
+    if (scrollerRef.current) {
+      scrollerRef.current.scrollTop = scrollerRef.current.scrollHeight
+    }
+  }, [messages, busy, proposed])
+
+  // Strip tool_use blocks out of stored assistant history before sending the
+  // next request — tool_use without a matching tool_result is a 400. The
+  // user-visible state of the proposed plan is enough context for the model.
+  function historyForApi(history) {
+    return history.map((m) => {
+      if (m.role !== 'assistant') {
+        return { role: 'user', content: m.content }
+      }
+      const text = m.displayText
+        ? m.displayText
+        : Array.isArray(m.content)
+          ? m.content
+              .filter((b) => b.type === 'text')
+              .map((b) => b.text)
+              .join('\n')
+          : ''
+      return {
+        role: 'assistant',
+        content: text || '(proposed a plan update)',
+      }
+    })
+  }
+
+  async function send() {
+    const text = input.trim()
+    if (!text || busy) return
+    if (!apiKey) {
+      setError('Add your Anthropic API key in Settings first.')
+      return
+    }
+    setError(null)
+    const userMsg = { role: 'user', content: text }
+    const next = [...messages, userMsg]
+    setMessages(next)
+    setInput('')
+    setBusy(true)
+    try {
+      const result = await callPlanChat(
+        apiKey,
+        historyForApi(next),
+        plan,
+        workouts,
+      )
+      const blocks = result.content || []
+      const textOut = blocks
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n')
+        .trim()
+      const toolUse = blocks.find((b) => b.type === 'tool_use')
+
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: blocks, displayText: textOut },
+      ])
+
+      if (toolUse && toolUse.input?.exercises) {
+        setProposed(toolUse.input.exercises)
+        setRationale(toolUse.input.rationale || '')
+      }
+    } catch (e) {
+      setError(e.message || 'Something went wrong.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function applyProposed() {
+    if (!proposed) return
+    const exercises = proposed.map((e) => ({
+      exercise: e.exercise,
+      muscleGroup: e.muscleGroup,
+      sets: Math.max(1, Number(e.sets) || 3),
+      reps: Math.max(1, Number(e.reps) || 10),
+      weight: 0,
+      isAnchor: !!e.isAnchor,
+    }))
+    const focus = Array.from(new Set(exercises.map((e) => e.muscleGroup))).slice(
+      0,
+      2,
+    )
+    onApply({
+      ...plan,
+      exercises,
+      focus: focus.length > 0 ? focus : plan.focus,
+      estimatedMinutes: exercises.reduce(
+        (sum, e) => sum + (e.isAnchor ? 8 : 5),
+        0,
+      ),
+      rationale: rationale || plan.rationale,
+    })
+  }
+
+  return (
+    <Shell>
+      <SleekBackBar onBack={onBack} title="Plan chat" />
+
+      <h1 className="text-4xl font-extrabold tracking-tight leading-none">
+        Adjust plan
+      </h1>
+      <p className="mt-1 text-sm text-zinc-500">
+        Tell the coach about target areas, soreness, or time you have.
+      </p>
+
+      {!apiKey && (
+        <div className="mt-5 bg-amber-950/30 ring-1 ring-amber-900/40 rounded-2xl p-4">
+          <div className="text-sm font-semibold text-amber-300">
+            API key required
+          </div>
+          <p className="mt-1 text-xs text-amber-200/70">
+            This screen sends a message to the Anthropic API. Add a key in
+            Settings → Plan chat to enable.
+          </p>
+          <button
+            onClick={onOpenSettings}
+            className="mt-3 w-full py-2.5 rounded-xl bg-amber-600 text-zinc-950 text-sm font-bold active:bg-amber-500"
+          >
+            Open settings
+          </button>
+        </div>
+      )}
+
+      {/* Chat scroller */}
+      <div
+        ref={scrollerRef}
+        className="mt-4 bg-zinc-900/40 rounded-2xl p-3 max-h-[40vh] overflow-y-auto space-y-2"
+      >
+        {messages.length === 0 && (
+          <div className="text-xs text-zinc-500 px-2 py-1.5 leading-relaxed">
+            Try: "My shoulders are tight, go easier there" or "Add more chest,
+            drop arms" or "I only have 30 minutes".
+          </div>
+        )}
+        {messages.map((m, i) => {
+          const text =
+            m.role === 'assistant'
+              ? m.displayText || ''
+              : typeof m.content === 'string'
+                ? m.content
+                : ''
+          if (!text && m.role === 'assistant') {
+            // Assistant turn was pure tool use — show a stub
+            return (
+              <div
+                key={i}
+                className="self-start max-w-[85%] px-3 py-2 rounded-xl bg-zinc-900/80 ring-1 ring-zinc-800/60 text-xs text-zinc-400 italic"
+              >
+                (proposed a plan update — see below)
+              </div>
+            )
+          }
+          return (
+            <div
+              key={i}
+              className={`max-w-[85%] px-3 py-2 rounded-xl text-sm whitespace-pre-wrap ${
+                m.role === 'user'
+                  ? 'ml-auto bg-emerald-600 text-zinc-950'
+                  : 'bg-zinc-900/80 text-zinc-100 ring-1 ring-zinc-800/60'
+              }`}
+            >
+              {text}
+            </div>
+          )
+        })}
+        {busy && (
+          <div className="px-3 py-2 rounded-xl bg-zinc-900/80 text-xs text-zinc-500 italic">
+            Thinking…
+          </div>
+        )}
+      </div>
+
+      {error && (
+        <div className="mt-2 text-xs text-orange-400 px-2">{error}</div>
+      )}
+
+      {/* Proposed plan preview */}
+      {proposed && (
+        <div className="mt-4 bg-emerald-950/40 ring-1 ring-emerald-900/40 rounded-2xl p-4">
+          <div className="text-xs text-emerald-400 font-bold tracking-wide uppercase">
+            Proposed plan
+          </div>
+          {rationale && (
+            <p className="mt-1 text-xs text-zinc-300">{rationale}</p>
+          )}
+          <div className="mt-3 space-y-1.5">
+            {proposed.map((e, i) => (
+              <div
+                key={i}
+                className="flex items-center justify-between text-xs"
+              >
+                <span className="text-zinc-100">
+                  {i + 1}. {e.exercise}
+                  <span className="text-zinc-500 ml-1">· {e.muscleGroup}</span>
+                </span>
+                <span className="font-mono tabular-nums text-zinc-300">
+                  {e.sets} × {e.reps}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <button
+              onClick={() => {
+                setProposed(null)
+                setRationale('')
+              }}
+              className="py-2.5 rounded-lg bg-zinc-900/60 text-xs font-medium active:bg-zinc-800/60"
+            >
+              Dismiss
+            </button>
+            <button
+              onClick={applyProposed}
+              className="py-2.5 rounded-lg bg-emerald-600 text-zinc-950 text-xs font-bold active:bg-emerald-500"
+            >
+              Apply to today
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Composer */}
+      <div className="mt-4 flex items-end gap-2">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Tell the coach what to change"
+          rows={2}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault()
+              send()
+            }
+          }}
+          className="flex-1 bg-zinc-900/60 rounded-xl px-3 py-2 text-sm placeholder:text-zinc-600 ring-1 ring-zinc-800/60 focus:outline-none focus:ring-zinc-600 resize-none"
+        />
+        <button
+          onClick={send}
+          disabled={busy || !input.trim() || !apiKey}
+          className={`px-4 py-3 rounded-xl text-sm font-bold ${
+            busy || !input.trim() || !apiKey
+              ? 'bg-zinc-900/60 text-zinc-600'
+              : 'bg-emerald-600 text-zinc-950 active:bg-emerald-500'
+          }`}
+        >
+          Send
         </button>
       </div>
     </Shell>
